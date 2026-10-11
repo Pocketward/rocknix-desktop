@@ -1,0 +1,259 @@
+#!/usr/bin/python3
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+BASE = Path(__file__).resolve().parent.parent
+STATE = Path('/run/rocknix-desktop-input-state')
+LOCK = Path('/run/rocknix-desktop-input.lock')
+BUS = 'org.shadowblip.InputPlumber'
+ROOT = '/org/shadowblip/InputPlumber'
+COMPOSITE = 'org.shadowblip.Input.CompositeDevice'
+TARGET = 'org.shadowblip.Input.Target'
+ROOT_UID = 0
+NORMAL_TARGETS = ['ds5', 'keyboard', 'mouse']
+REQUIRED = {f'Gamepad:{kind}:{name}' for kind, names in (
+    ('Axis', 'LeftStick RightStick'),
+    ('Trigger', 'LeftTrigger RightTrigger'),
+    ('Button', 'South East North West Start Select LeftStick RightStick LeftBumper RightBumper'),
+) for name in names.split()}
+
+
+def call(destination, path, interface, method, *args, reply=None):
+    result = subprocess.run(['busctl', '--system', '--json=short', '--timeout=5',
+                             'call', destination, path, interface, method, *args],
+                            check=True, capture_output=True, text=True, timeout=8)
+    if reply is None:
+        return None
+    value = json.loads(result.stdout)
+    if value.get('type') != reply or not isinstance(value.get('data'), list) or len(value['data']) != 1:
+        raise ValueError('Unexpected InputPlumber D-Bus reply')
+    return value['data'][0]
+
+
+def service_owner():
+    owner = call('org.freedesktop.DBus', '/org/freedesktop/DBus',
+                 'org.freedesktop.DBus', 'GetNameOwner', 's', BUS, reply='s')
+    if not isinstance(owner, str) or not re.fullmatch(r':[0-9]+\.[0-9]+', owner):
+        raise ValueError('Invalid InputPlumber service owner')
+    return owner
+
+
+def properties(owner, path, interface):
+    value = call(owner, path, 'org.freedesktop.DBus.Properties', 'GetAll',
+                 's', interface, reply='a{sv}')
+    if not isinstance(value, dict):
+        raise ValueError('Invalid InputPlumber properties')
+    return value
+
+
+def prop(properties, name, signature):
+    value = properties[name]
+    data = value['data']
+    if value['type'] != signature or (signature == 's' and not isinstance(data, str)) or (
+            signature == 'as' and (not isinstance(data, list) or any(not isinstance(x, str) for x in data))):
+        raise ValueError(f'Invalid InputPlumber property {name}')
+    return data
+
+
+def source_identity(path):
+    if not re.fullmatch(r'/dev/input/event[0-9]+', path):
+        raise ValueError(f'Unsupported InputPlumber source path {path}')
+    # InputPlumber moves hidden nodes but reports their original paths over D-Bus.
+    locations = [Path(path), Path('/dev/inputplumber/sources') / Path(path).name]
+    present = []
+    for location in locations:
+        try:
+            location.lstat()
+        except FileNotFoundError:
+            continue
+        present.append(location)
+    if len(present) != 1:
+        raise ValueError(f'Expected one InputPlumber source node for {path}, found {len(present)}')
+    location = present[0]
+    with os.fdopen(os.open(location, os.O_PATH | os.O_NOFOLLOW), 'rb') as source:
+        node = os.fstat(source.fileno())
+        if not stat.S_ISCHR(node.st_mode) or node.st_uid != ROOT_UID or location.resolve() != location:
+            raise ValueError(f'Untrusted InputPlumber source {path}')
+        kernel = (Path('/sys/class/input') / Path(path).name).resolve(strict=True)
+        identity = kernel.stat()
+        if (not kernel.is_relative_to('/sys/devices') or not stat.S_ISDIR(identity.st_mode)
+                or identity.st_uid != ROOT_UID
+                or (kernel / 'dev').read_text().strip() != f'{os.major(node.st_rdev)}:{os.minor(node.st_rdev)}'):
+            raise ValueError(f'InputPlumber source disagrees with sysfs {path}')
+        for candidate in locations:
+            try:
+                current = candidate.lstat()
+            except FileNotFoundError:
+                if candidate == location:
+                    raise
+                continue
+            if (candidate != location or (current.st_dev, current.st_ino, current.st_rdev)
+                    != (node.st_dev, node.st_ino, node.st_rdev)):
+                raise ValueError(f'InputPlumber source changed {path}')
+        return [node.st_dev, node.st_ino, node.st_rdev, str(kernel), identity.st_dev, identity.st_ino]
+
+
+def sources(properties):
+    paths = prop(properties, 'SourceDevicePaths', 'as')
+    if not paths or len(set(paths)) != len(paths):
+        raise ValueError('InputPlumber composite has no unique physical sources')
+    return {path: source_identity(path) for path in sorted(paths)}
+
+
+def targets(owner, current):
+    kinds = [prop(properties(owner, path, TARGET), 'DeviceType', 's')
+             for path in prop(current, 'TargetDevices', 'as')]
+    if any(not kind or '/' in kind for kind in kinds):
+        raise ValueError('InputPlumber target types are unavailable')
+    return sorted(kinds)
+
+
+def discover():
+    owner = service_owner()
+    objects = call(owner, ROOT, 'org.freedesktop.DBus.ObjectManager', 'GetManagedObjects',
+                   reply='a{oa{sa{sv}}}')
+    if not isinstance(objects, dict):
+        raise ValueError('Invalid InputPlumber object inventory')
+    candidates = []
+    for path, interfaces in objects.items():
+        if COMPOSITE in interfaces:
+            current = properties(owner, path, COMPOSITE)
+            if REQUIRED <= set(prop(current, 'Capabilities', 'as')):
+                candidates.append((path, current))
+    if len(candidates) != 1:
+        raise ValueError(f'Expected one controller composite, found {len(candidates)}')
+    path, current = candidates[0]
+    profile = prop(current, 'ProfilePath', 's')
+    if not Path(profile).is_absolute():
+        raise ValueError('InputPlumber original profile path is unavailable')
+    saved = {'owner': owner, 'composite': path, 'sources': sources(current),
+             'profile': profile, 'targets': targets(owner, current)}
+    if not saved['targets']:
+        raise ValueError('InputPlumber original target types are unavailable')
+    checked(saved)
+    return saved
+
+
+def checked(saved):
+    if service_owner() != saved['owner']:
+        raise ValueError('InputPlumber service owner changed; session retained')
+    current = properties(saved['owner'], saved['composite'], COMPOSITE)
+    if sources(current) != saved['sources']:
+        raise ValueError('InputPlumber source identity changed; session retained')
+    return current
+
+
+def trusted_open(path, flags=os.O_RDONLY):
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    metadata = os.fstat(fd)
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != ROOT_UID
+            or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_nlink != 1):
+        os.close(fd)
+        raise ValueError(f'Untrusted input session file {path}')
+    return os.fdopen(fd, 'r')
+
+
+def journal():
+    try:
+        with trusted_open(STATE) as source:
+            saved = json.loads(source.read(65537))
+    except FileNotFoundError:
+        return None
+    if not isinstance(saved, dict) or set(saved) != {'owner', 'composite', 'sources', 'profile', 'targets', 'desktop'}:
+        raise ValueError('Invalid input session journal; retained for recovery')
+    if (any(not isinstance(saved[key], str) for key in ('owner', 'composite', 'profile', 'desktop'))
+            or not re.fullmatch(r':[0-9]+\.[0-9]+', saved['owner'])
+            or not saved['composite'].startswith(ROOT + '/')
+            or not all(Path(saved[key]).is_absolute() for key in ('profile', 'desktop'))
+            or not isinstance(saved['sources'], dict) or not saved['sources']
+            or not isinstance(saved['targets'], list) or not saved['targets']
+            or any(not isinstance(kind, str) or not kind or '/' in kind for kind in saved['targets'])):
+        raise ValueError('Invalid input session identity; retained for recovery')
+    return saved
+
+
+def persist(saved):
+    fd, name = tempfile.mkstemp(dir=STATE.parent, prefix=STATE.name + '.')
+    try:
+        with os.fdopen(fd, 'w') as output:
+            os.fchmod(output.fileno(), 0o600)
+            json.dump(saved, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(name, STATE)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def wait_for(saved, profile, kinds=None):
+    deadline = time.monotonic() + 5
+    while True:
+        current = checked(saved)
+        try:
+            if (prop(current, 'ProfilePath', 's') == profile
+                    and (kinds is None or targets(saved['owner'], current) == sorted(kinds))):
+                return
+        except subprocess.CalledProcessError:
+            pass  # Target objects can disappear while InputPlumber replaces them.
+        if time.monotonic() >= deadline:
+            raise ValueError('InputPlumber readback did not match; session retained')
+        time.sleep(.1)
+
+
+def apply(saved, profile, kinds):
+    current = checked(saved)
+    if prop(current, 'ProfilePath', 's') != profile:
+        call(saved['owner'], saved['composite'], COMPOSITE, 'LoadProfilePath', 's', profile)
+    wait_for(saved, profile)
+    checked(saved)
+    call(saved['owner'], saved['composite'], COMPOSITE, 'SetTargetDevices',
+         'as', str(len(kinds)), *kinds)
+    wait_for(saved, profile, kinds)
+
+
+def session(action):
+    parent = STATE.parent.lstat()
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != ROOT_UID or parent.st_mode & 0o022:
+        raise ValueError('Untrusted input session directory')
+    with trusted_open(LOCK, os.O_RDWR | os.O_CREAT) as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        saved = journal()
+        if saved is None:
+            if action == 'restore':
+                return
+            if action != 'begin':
+                raise ValueError('No active input session')
+            desktop = BASE / 'input/desktop.yaml'
+            if not desktop.is_file():
+                raise ValueError('Desktop input profile is missing')
+            saved = {**discover(), 'desktop': str(desktop)}
+            persist(saved)
+        if action == 'restore':
+            apply(saved, saved['profile'], saved['targets'])
+            STATE.unlink()
+        elif action in ('begin', 'desktop', 'game'):
+            apply(saved, saved['profile'] if action == 'game' else saved['desktop'],
+                  NORMAL_TARGETS)
+        else:
+            raise ValueError('Invalid input session action')
+
+
+if __name__ == '__main__':
+    try:
+        if os.geteuid() != 0:
+            raise ValueError('Input session helper requires root')
+        if len(sys.argv) != 2 or sys.argv[1] not in ('begin', 'desktop', 'game', 'restore'):
+            raise ValueError('Usage: rocknix-input-session begin|desktop|game|restore')
+        session(sys.argv[1])
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        print(f'Input session: {error}', file=sys.stderr)
+        raise SystemExit(1)

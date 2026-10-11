@@ -1,0 +1,16 @@
+name: Build Desktop LXC
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: desktop-lxc-build
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build

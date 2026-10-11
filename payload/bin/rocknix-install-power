@@ -1,0 +1,75 @@
+#!/usr/bin/python3
+from pathlib import Path
+
+SUPPLIES = Path('/sys/class/power_supply')
+MINIMUM = 10
+
+
+def require_power(supplies=SUPPLIES):
+    try:
+        sysfs = supplies.resolve(strict=True).parent.parent
+        batteries = []
+        for supply in supplies.iterdir():
+            kind = (supply / 'type').read_bytes().decode('ascii').rstrip('\n')
+            if kind != 'Battery':
+                if kind not in ('UPS', 'Mains', 'USB', 'USB_DCP', 'USB_CDP', 'USB_ACA', 'USB_C',
+                                'USB_PD', 'USB_PD_DRP', 'BrickID', 'Wireless'):
+                    raise ValueError('unknown power supply type')
+                continue
+            try:
+                scope = (supply / 'scope').read_bytes().decode('ascii').rstrip('\n')
+            except FileNotFoundError:
+                if (supply / 'scope').is_symlink() or not (supply / 'device').is_symlink():
+                    raise ValueError('unreadable battery identity')
+                device = (supply / 'device').resolve(strict=True)
+                devices = sysfs / 'devices'
+                if not device.is_dir() or not device.is_relative_to(devices) or device == devices:
+                    raise ValueError('invalid battery device ancestry')
+                scope, board, known = 'Unknown', False, True
+                while device != devices:
+                    if device == devices / 'virtual':
+                        scope = 'Device'
+                        break
+                    link = device / 'subsystem'
+                    if not link.is_symlink():
+                        if device.parent != devices or link.exists():
+                            known = False
+                    else:
+                        subsystem = link.resolve(strict=True)
+                        if not subsystem.is_dir() or subsystem.parent not in (sysfs / 'bus', sysfs / 'class'):
+                            raise ValueError('invalid battery subsystem')
+                        if subsystem.name in ('usb', 'hid', 'input', 'bluetooth'):
+                            scope = 'Device'
+                            break
+                        if subsystem.parent != sysfs / 'bus':
+                            known = False
+                        elif subsystem.name in ('platform', 'acpi'):
+                            board = True
+                        elif subsystem.name not in ('auxiliary', 'i2c', 'spi', 'spmi'):
+                            known = False
+                    device = device.parent
+                if scope != 'Device' and board and known:
+                    scope = 'System'
+            if scope == 'Device':
+                continue
+            if scope != 'System':
+                raise ValueError('unknown battery scope')
+            batteries.append(supply)
+        if len(batteries) != 1:
+            raise ValueError('expected exactly one system battery')
+
+        raw = (batteries[0] / 'capacity').read_bytes().decode('ascii').rstrip('\n')
+        if not raw or len(raw) > 3 or not raw.isdecimal():
+            raise ValueError('invalid capacity')
+        capacity = int(raw)
+        if capacity > 100:
+            raise ValueError('capacity out of range')
+    except (OSError, ValueError) as error:
+        raise RuntimeError('Cannot identify one readable system battery; installation/update blocked. Restore battery telemetry and retry.') from error
+    if capacity < MINIMUM:
+        raise RuntimeError(f'Battery is {capacity}%; charge to at least {MINIMUM}% before installation/update, even when plugged in.')
+    return capacity
+
+
+if __name__ == '__main__':
+    print(f'Battery check passed: {require_power()}% (minimum {MINIMUM}%).')

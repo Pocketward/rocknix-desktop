@@ -1,0 +1,241 @@
+#!/usr/bin/python3
+"""Host-owned device selection; experimental consent never supplies mount paths."""
+import argparse
+import errno
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import struct
+import stat
+import sys
+from typing import NamedTuple
+
+STATE = Path('/storage/rocknix-desktop/managed/host/state/device.json')
+RP6 = 'Retroid Pocket 6'
+
+DRM_IOCTL_GET_CAP = 0xC010640C
+DRM_CAP_PRIME = 5
+VIDIOC_QUERYCAP = 0x80685600
+VIDIOC_ENUM_FMT = 0xC0405602
+V4L2_CAP_VIDEO_M2M_MPLANE = 0x00004000
+V4L2_CAP_VIDEO_M2M = 0x00008000
+V4L2_CAP_STREAMING = 0x04000000
+V4L2_CAP_DEVICE_CAPS = 0x80000000
+V4L2_FMT_FLAG_COMPRESSED = 0x0001
+V4L2_PIX_FMT_H264 = 0x34363248
+
+
+class Endpoint(NamedTuple):
+    path: str
+    identity: tuple
+    evidence: tuple
+
+
+class ProbeResults(NamedTuple):
+    endpoints: tuple
+    diagnostics: tuple
+
+
+def _node_identity(info):
+    return (info.st_dev, info.st_ino, info.st_rdev)
+
+
+def _check_node(info, device_number):
+    if not stat.S_ISCHR(info.st_mode) or info.st_uid != 0 or info.st_rdev != device_number:
+        raise ValueError('not a root-owned character node matching sysfs dev')
+
+
+def _probe_nodes(class_dir, device_dir, pattern, probe):
+    endpoints, diagnostics = [], []
+    try:
+        names = sorted(os.listdir(class_dir))
+    except OSError as error:
+        return ProbeResults((), (f'{class_dir}: {error}',))
+    for name in names:
+        if not re.fullmatch(pattern, name):
+            continue
+        path, fd = os.path.join(device_dir, name), None
+        try:
+            numbers = Path(class_dir, name, 'dev').read_text().strip().split(':')
+            if len(numbers) != 2:
+                raise ValueError('invalid sysfs dev number')
+            device_number = os.makedev(int(numbers[0]), int(numbers[1]))
+            before_path = os.lstat(path)
+            _check_node(before_path, device_number)
+            identity = _node_identity(before_path)
+            fd = os.open(path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW)
+            if _node_identity(os.fstat(fd)) != identity:
+                raise ValueError('opened device identity changed')
+            evidence = probe(fd)
+            after_fd, after_path = os.fstat(fd), os.lstat(path)
+            after_dev = Path(class_dir, name, 'dev').read_text().strip().split(':')
+            if len(after_dev) != 2 or os.makedev(int(after_dev[0]), int(after_dev[1])) != device_number:
+                raise ValueError('sysfs device number changed during probe')
+            _check_node(after_path, device_number)
+            if _node_identity(after_fd) != identity or _node_identity(after_path) != identity:
+                raise ValueError('device identity changed during probe')
+            endpoint = Endpoint(path, identity, evidence)
+            os.close(fd)
+            fd = None
+            endpoints.append(endpoint)
+        except (OSError, ValueError, OverflowError, struct.error) as error:
+            diagnostics.append(f'{path}: {error}')
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    return ProbeResults(tuple(endpoints), tuple(diagnostics))
+
+
+def _drm_probe(fd):
+    data = bytearray(struct.pack('=QQ', DRM_CAP_PRIME, 0))
+    fcntl.ioctl(fd, DRM_IOCTL_GET_CAP, data, True)
+    capability, value = struct.unpack('=QQ', data)
+    if capability != DRM_CAP_PRIME:
+        raise ValueError('DRM capability query mismatch')
+    return (('DRM_CAP_PRIME', value),)
+
+
+def probe_render_nodes():
+    return _probe_nodes('/sys/class/drm', '/dev/dri', r'renderD[0-9]+', _drm_probe)
+
+
+def _selection_diagnostic(label, result):
+    paths = ', '.join(endpoint.path for endpoint in result.endpoints)
+    detail = '; rejected candidates: ' + '; '.join(result.diagnostics) if result.diagnostics else ''
+    message = f'ambiguous {label}: {paths}' if len(result.endpoints) > 1 else f'no eligible {label}'
+    return message + detail
+
+
+def select_render_endpoint(result):
+    if len(result.endpoints) != 1:
+        raise RuntimeError(_selection_diagnostic('DRM render endpoint', result))
+    return result.endpoints[0]
+
+
+def _enum_formats(fd, queue_type):
+    formats = []
+    for index in range(64):
+        data = bytearray(64)
+        struct.pack_into('=II', data, 0, index, queue_type)
+        try:
+            fcntl.ioctl(fd, VIDIOC_ENUM_FMT, data, True)
+        except OSError as error:
+            if error.errno == errno.EINVAL:
+                return tuple(formats)
+            raise
+        formats.append((struct.unpack_from('=I', data, 44)[0],
+                        struct.unpack_from('=I', data, 8)[0]))
+    raise ValueError('V4L2 format enumeration limit exceeded')
+
+
+def _decoder_probe(fd):
+    capability = bytearray(104)
+    fcntl.ioctl(fd, VIDIOC_QUERYCAP, capability, True)
+    capabilities, device_caps = struct.unpack_from('=II', capability, 84)
+    effective = device_caps if capabilities & V4L2_CAP_DEVICE_CAPS else capabilities
+    if not effective & V4L2_CAP_STREAMING:
+        raise ValueError('V4L2 streaming capability missing')
+    queues = []
+    if effective & V4L2_CAP_VIDEO_M2M:
+        queues.append((2, 1))
+    if effective & V4L2_CAP_VIDEO_M2M_MPLANE:
+        queues.append((10, 9))
+    if not queues:
+        raise ValueError('stateful V4L2 memory-to-memory capability missing')
+    accepted, failures = [], []
+    for output_type, capture_type in queues:
+        try:
+            output = _enum_formats(fd, output_type)
+            capture = _enum_formats(fd, capture_type)
+        except OSError as error:
+            failures.append(str(error))
+            continue
+        h264 = any(code == V4L2_PIX_FMT_H264 and flags & V4L2_FMT_FLAG_COMPRESSED
+                   for code, flags in output)
+        raw = any(not flags & V4L2_FMT_FLAG_COMPRESSED for _, flags in capture)
+        if h264 and raw:
+            accepted.append((output_type, capture_type, output, capture))
+    if not accepted:
+        detail = ': ' + ', '.join(failures) if failures else ''
+        raise ValueError('no compressed H264 OUTPUT and raw CAPTURE pair' + detail)
+    return (('effective_capabilities', effective), ('queues', tuple(accepted)))
+
+
+def probe_v4l2_nodes():
+    return _probe_nodes('/sys/class/video4linux', '/dev', r'video[0-9]+', _decoder_probe)
+
+
+def select_decoder_endpoint(result):
+    if len(result.endpoints) == 1:
+        return (result.endpoints[0], None)
+    return (None, _selection_diagnostic('V4L2 decoder endpoint', result))
+
+
+def identity():
+    model = Path('/proc/device-tree/model').read_bytes().rstrip(b'\0').decode('utf-8')
+    if not model or len(model) > 200 or any(ord(c) < 32 for c in model):
+        raise RuntimeError('missing or invalid device-tree model')
+    if os.uname().machine != 'aarch64':
+        raise RuntimeError('only ARM64 ROCKNIX is eligible')
+    release = Path('/etc/os-release').read_text()
+    if not re.search(r'^OS_NAME=[\"\']?ROCKNIX[\"\']?$', release, re.M):
+        raise RuntimeError('requires native ROCKNIX')
+    return model
+
+
+def consent(model, path=STATE):
+    if not os.path.lexists(path):
+        return False
+    for parent in path.parents:
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise RuntimeError('unsafe device consent ancestor')
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise RuntimeError('unsafe device consent record')
+    return json.loads(path.read_text()) == {'format': 1, 'model': model,
+                                           'architecture': 'aarch64', 'experimental': True}
+
+
+def require_identity(allow=False):
+    model = identity()
+    if model != RP6 and not (allow or consent(model)):
+        raise RuntimeError(f'{model}: untested device; run the installer and confirm its device warning')
+    return model
+
+
+def resolve(allow=False):
+    model = require_identity(allow)
+    render_result = probe_render_nodes()
+    render = select_render_endpoint(render_result)
+    decoder_result = probe_v4l2_nodes()
+    decoder, diagnostic = select_decoder_endpoint(decoder_result)
+    profile = {'model': model, 'architecture': 'aarch64', 'experimental': model != RP6,
+               'render': render._asdict(), 'decoder': decoder._asdict() if decoder else None,
+               'decoder_diagnostic': diagnostic}
+    for rejection in render_result.diagnostics:
+        print(f'Rejected DRM render candidate: {rejection}', file=sys.stderr)
+    if decoder:
+        for rejection in decoder_result.diagnostics:
+            print(f'Rejected V4L2 decoder candidate: {rejection}', file=sys.stderr)
+    return profile
+
+
+def save_consent(profile, atomic, path=STATE):
+    if profile['experimental']:
+        atomic(path, (json.dumps({'format': 1, 'model': profile['model'],
+                                 'architecture': 'aarch64', 'experimental': True}) + '\n').encode(), 0o600)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.parse_args()
+    try:
+        print(json.dumps(resolve(os.environ.get('ROCKNIX_UNTESTED_DEVICE_CONFIRMED') == '1'), indent=2))
+    except (OSError, ValueError, RuntimeError) as error:
+        parser.exit(1, f'Device profile check failed: {error}\n')

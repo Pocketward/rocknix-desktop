@@ -1,0 +1,332 @@
+#!/usr/bin/python3
+"""Host-defined desktop mounts; no guest-configurable host paths or hooks."""
+import os
+import json
+from pathlib import Path
+import re
+import runpy
+import stat
+import subprocess
+import sys
+
+ACCESS = runpy.run_path(str(Path(__file__).with_name('rocknix-lxc-access')))
+AUDIO = runpy.run_path(str(Path(__file__).with_name('rocknix-audio')))
+PROFILE = runpy.run_path(str(Path(__file__).with_name('rocknix-device-profile')))
+SHARED = ('Desktop', 'Steam', 'backup', 'games-external', 'games-internal')
+FEX_ARCH = Path('/storage/.local/share/fex-emu/RootFS/ArchLinux')
+FEX_FILES = (('/usr/bin/FEX', 'fex-bin', 'bin/FEX'),
+             ('/usr/bin/FEXServer', 'fex-server', 'bin/FEXServer'),
+             ('/usr/lib/libfmt.so.12', 'fex-fmt', 'lib/libfmt.so.12'))
+NATIVE_LIBS = ('libvulkan_freedreno.so', 'libdrm.so.2',
+               'libdisplay-info.so.4', 'libwayland-client.so.0')
+NATIVE_GRAPHICS = ('libEGL_mesa.so.0', 'libGLX_mesa.so.0', 'libgbm.so.1')
+NATIVE_CODECS = ('libavcodec.so.61', 'libavformat.so.61', 'libavutil.so.59',
+                 'libavfilter.so.10', 'libavdevice.so.61', 'libswresample.so.5',
+                 'libswscale.so.8', 'libdav1d.so.7')
+STAGES = ('rootfs', 'home', 'control', 'wayland', 'pulse', 'render', 'decoder', 'fex-arch',
+          *(name for _, name, _ in FEX_FILES), *SHARED,
+          'native-vulkan.json', 'native-egl.json', 'native-msm_dri.so', 'native-dri_gbm.so',
+          *('native-' + name for name in (*NATIVE_LIBS, *NATIVE_GRAPHICS, *NATIVE_CODECS)))
+
+
+def fex_host_file(source):
+    path = Path(source).resolve(strict=True)
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise RuntimeError('unsafe native FEX runtime file')
+    trusted_directory(path.parent, 0)
+    if path.parent.stat().st_mode & 0o022:
+        raise RuntimeError('unsafe native FEX runtime directory')
+    return path
+
+
+def fex_arch_source(path=FEX_ARCH):
+    """Optional host-managed x86 data, never host-executed guest code."""
+    if not os.path.lexists(path):
+        return None
+    info = path.lstat()
+    if info.st_uid not in (0, 1000) or info.st_mode & 0o022:
+        raise RuntimeError('unsafe host FEX RootFS ownership or permissions')
+    # ROCKNIX's unpacked image belongs to UID1000. Its ancestors must remain
+    # native-root-controlled; do not accept arbitrary user-selected paths.
+    trusted_directory(path, info.st_uid)
+    return path
+
+
+def fex_sources():
+    """Optional translation capability; unsafe sources still fail closed."""
+    arch = fex_arch_source()
+    if arch is None:
+        return None
+    try:
+        files = [(fex_host_file(source), name, destination)
+                 for source, name, destination in FEX_FILES]
+    except FileNotFoundError:
+        print('Native FEX runtime incomplete; x86 translation unavailable in this session.',
+              file=sys.stderr)
+        return None
+    return arch, files
+
+
+def trusted_directory(path, owner):
+    path = Path(path)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != owner:
+        raise RuntimeError(f'unexpected directory ownership: {path}')
+    for parent in path.parents:
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise RuntimeError(f'unsafe mount source ancestor: {parent}')
+    return path
+
+
+class DesktopMounts:
+    def __init__(self, tools, state, rootfs, home, bridge=Path('/run/rocknix-desktop'),
+                 wayland=Path('/run/0-runtime-dir/wayland-1'), shared=True):
+        self.tools, self.state = Path(tools), Path(state)
+        self.profile = PROFILE['resolve']()
+        self.rootfs = trusted_directory(rootfs, 200000)
+        self.home = trusted_directory(home, 201000)
+        self.bridge = trusted_directory(bridge, 0)
+        if self.bridge.stat().st_mode & 0o022:
+            raise RuntimeError('control bridge must not be writable by the desktop')
+        self.wayland = Path(wayland)
+        ACCESS['AccessLease'].validate(self.wayland)
+        self.shared = shared
+        self.directory = self.state / 'desktop-mounts'
+        self.bound = []
+        self.access = None
+        self.audio = None
+        self.native_environment = ''
+
+    def native_providers(self):
+        # Experimental opt-in belongs to the protected host state, never to
+        # guest configuration. Re-resolve exact native files each session.
+        selection = self.tools.parent / 'state/native-providers'
+        if not os.path.lexists(selection):
+            return []
+        mode = fex_host_file(selection).read_text().strip()
+        if mode not in ('vulkan', 'graphics', 'codecs') or self.profile['model'] != PROFILE['RP6']:
+            raise RuntimeError('unsupported native provider selection')
+        entries = []
+        files = [(name, '/usr/lib/' + name, 'lib/' + name) for name in NATIVE_LIBS]
+        if mode in ('graphics', 'codecs'):
+            gallium = list(Path('/usr/lib').glob('libgallium-*.so'))
+            if len(gallium) != 1 or not re.fullmatch(r'libgallium-[0-9]+(?:\.[0-9]+)+\.so', gallium[0].name):
+                raise RuntimeError('ambiguous native Mesa Gallium family')
+            files += [(name, '/usr/lib/' + name, 'lib/' + name)
+                      for name in (*NATIVE_GRAPHICS, gallium[0].name)]
+            files.append(('msm_dri.so', '/usr/lib/dri/msm_dri.so', 'dri/msm_dri.so'))
+            files.append(('dri_gbm.so', '/usr/lib/gbm/dri_gbm.so', 'gbm/dri_gbm.so'))
+        if mode == 'codecs':
+            files += [(name, '/usr/lib/' + name, 'codecs/' + name) for name in NATIVE_CODECS]
+        for name, native_path, destination in files:
+            source = fex_host_file(native_path)
+            if source.parent not in (Path('/usr/lib'), Path('/usr/lib/dri'), Path('/usr/lib/gbm')):
+                raise RuntimeError('native provider escaped the firmware library directory')
+            # Do not accept ARM32 providers or import the host loader/libc.
+            with source.open('rb') as stream:
+                header = stream.read(20)
+            if header[:6] != b'\x7fELF\x02\x01' or header[18:20] != b'\xb7\x00':
+                raise RuntimeError('native provider is not little-endian ARM64 ELF')
+            target = self.bind(source, 'native-' + name)
+            subprocess.run(['/usr/bin/mount', '-o', 'remount,bind,ro,nosuid,nodev', str(target)], check=True)
+            entries.append(f'lxc.mount.entry = {target} run/rocknix-native/{destination} none bind,ro,nosuid,nodev,create=file 0 0')
+        native_manifest = fex_host_file('/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json')
+        data = json.loads(native_manifest.read_text())
+        api_version = data['ICD']['api_version']
+        if data['ICD']['library_path'] != '/usr/lib/libvulkan_freedreno.so' or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', api_version):
+            raise RuntimeError('unexpected native Vulkan manifest')
+        manifest = self.directory / 'native-vulkan.json'
+        manifest.write_text(json.dumps({'file_format_version': '1.0.0', 'ICD': {
+            'library_path': '/run/rocknix-native/lib/libvulkan_freedreno.so',
+            'api_version': api_version}}) + '\n')
+        manifest.chmod(0o644)
+        entries.append(f'lxc.mount.entry = {manifest} run/rocknix-native/vulkan.json none bind,ro,nosuid,nodev,create=file 0 0')
+        self.native_environment = ('VK_DRIVER_FILES=/run/rocknix-native/vulkan.json\n'
+                                   'LD_LIBRARY_PATH=/run/rocknix-native/lib\n')
+        if mode in ('graphics', 'codecs'):
+            # Firefox's decoder broker derives readable provider paths from
+            # this list, including the generated EGL manifest and plugins.
+            self.native_environment = self.native_environment.replace(
+                'LD_LIBRARY_PATH=/run/rocknix-native/lib\n',
+                'LD_LIBRARY_PATH=/run/rocknix-native/lib:/run/rocknix-native/dri:'
+                '/run/rocknix-native/gbm:/run/rocknix-native\n')
+            egl = self.directory / 'native-egl.json'
+            egl.write_text(json.dumps({'file_format_version': '1.0.0', 'ICD': {
+                'library_path': '/run/rocknix-native/lib/libEGL_mesa.so.0'}}) + '\n')
+            egl.chmod(0o644)
+            entries.append(f'lxc.mount.entry = {egl} run/rocknix-native/egl.json none bind,ro,nosuid,nodev,create=file 0 0')
+            self.native_environment += ('__EGL_VENDOR_LIBRARY_FILENAMES=/run/rocknix-native/egl.json\n'
+                                        '__GLX_VENDOR_LIBRARY_NAME=mesa\n'
+                                        'LIBGL_DRIVERS_PATH=/run/rocknix-native/dri\n'
+                                        'GBM_BACKENDS_PATH=/run/rocknix-native/gbm\n')
+        if mode == 'codecs':
+            self.native_environment += 'ROCKNIX_NATIVE_CODECS=1\n'
+        print(f'Experimental native {mode} selected; provider load failures are fatal to the consumer.', flush=True)
+        return entries
+
+    def tool(self, name, *args):
+        lib = self.tools / 'usr/lib/aarch64-linux-gnu'
+        return [str(lib / 'ld-linux-aarch64.so.1'), '--library-path', str(lib),
+                str(self.tools / 'usr/bin' / name), *map(str, args)]
+
+    def bind(self, source, name, directory=False, idmap=False, fd=None):
+        target = self.directory / name
+        if directory:
+            target.mkdir(mode=0o755)
+        else:
+            target.touch(mode=0o600)
+        if fd is not None:
+            info = os.fstat(fd)
+            identity = (info.st_dev, info.st_ino, info.st_rdev)
+            self.access._check_identity(source, fd, identity)
+            command = ['/usr/bin/mount', '--no-canonicalize', '--bind', f'/proc/self/fd/{fd}', str(target)]
+        elif idmap:
+            command = self.tool('mount', '--bind', '-o', 'X-mount.idmap=b:0:201000:1', source, target)
+        else:
+            command = ['/usr/bin/mount', '--bind', str(source), str(target)]
+        subprocess.run(command, check=True, pass_fds=() if fd is None else (fd,))
+        self.bound.append(target)
+        if fd is not None:
+            self.access._check_identity(source, fd, identity)
+            self.access._check_identity(target, fd, identity)
+        return target
+
+    def gamepad_mounts(self):
+        entries = []
+        for source in sorted(Path('/dev/input').glob('event*')):
+            try:
+                info = ACCESS['virtual_gamepad'](source)
+            except (OSError, RuntimeError):
+                continue
+            fd = self.access.grant(source, expected_identity=(info.st_dev, info.st_ino, info.st_rdev))
+            target = self.bind(source, 'gamepad-' + source.name, fd=fd)
+            major, minor = os.major(info.st_rdev), os.minor(info.st_rdev)
+            entries += [f'lxc.mount.entry = {target} dev/input/{source.name} none bind,create=file 0 0',
+                        f'lxc.cgroup.devices.allow = c {major}:{minor} rw']
+            # libudev/SDL need discovery properties as well as an evdev node.
+            # Export only the approved virtual gamepad's properties, not host udev.
+            metadata = self.directory / ('gamepad-' + source.name + '-udev')
+            metadata.write_text('E:ID_INPUT=1\nE:ID_INPUT_JOYSTICK=1\nV:1\n')
+            metadata.chmod(0o644)
+            entries.append(f'lxc.mount.entry = {metadata} run/udev/data/c{major}:{minor} none bind,ro,create=file 0 0')
+        return entries
+
+    def prepare(self):
+        # Must precede every bind, including the writable rootfs staging bind.
+        os.unshare(os.CLONE_NEWNS)
+        subprocess.run(['/usr/bin/mount', '--make-rprivate', '/'], check=True)
+        self.directory.mkdir(mode=0o711)
+        root = self.bind(self.rootfs, 'rootfs', directory=True)
+        home = self.bind(self.home, 'home', directory=True)
+        control = self.bind(self.bridge, 'control', directory=True)
+        self.access = ACCESS['AccessLease'](self.tools, self.state / 'desktop-access')
+        self.audio = AUDIO['AudioBridge'](self.tools)
+        audio = self.bind(self.audio.start(), 'pulse')
+        entries = [f'lxc.mount.entry = {home} home/rocknix none bind,create=dir 0 0',
+                   f'lxc.mount.entry = {audio} run/rocknix-bridge/pulse none bind,ro,create=file 0 0',
+                   f'lxc.mount.entry = {control} run/rocknix-desktop none bind,ro,create=dir 0 0']
+        entries += self.native_providers()
+        entries += self.gamepad_mounts()
+        fd = self.access.grant(self.wayland)
+        target = self.bind(self.wayland, 'wayland', fd=fd)
+        entries.append(f'lxc.mount.entry = {target} run/rocknix-bridge/wayland-1 none bind,create=file,ro 0 0')
+        for name in ('render', 'decoder'):
+            endpoint = self.profile[name]
+            if endpoint is None:
+                print(f"Hardware decoding unavailable: {self.profile['decoder_diagnostic']}", file=sys.stderr)
+                continue
+            source = Path(endpoint['path'])
+            fd = self.access.grant(source, expected_identity=endpoint['identity'])
+            target = self.bind(source, name, fd=fd)
+            entries.append(f'lxc.mount.entry = {target} {source.relative_to("/")} none bind,create=file 0 0')
+            device = endpoint['identity'][2]
+            entries.append(f'lxc.cgroup.devices.allow = c {os.major(device)}:{os.minor(device)} rwm')
+        if self.shared:
+            for name in SHARED:
+                source = Path('/storage') / name
+                if not source.exists() and not source.is_symlink():
+                    continue
+                trusted_directory(source, 0)
+                target = self.bind(source, name, directory=True, idmap=True)
+                entries.append(f'lxc.mount.entry = {target} storage/{name} none bind,create=dir 0 0')
+        fex = fex_sources() if self.profile['model'] == PROFILE['RP6'] else None
+        if fex is not None:
+            arch, files = fex
+            target = self.bind(arch, 'fex-arch', directory=True)
+            subprocess.run(['/usr/bin/mount', '-o', 'remount,bind,ro,nosuid,nodev', str(target)], check=True)
+            entries.append(f'lxc.mount.entry = {target} run/rocknix-fex/ArchLinux none bind,ro,nosuid,nodev,create=dir 0 0')
+            # RP6's verified native FEX dependency set. Never expose all of
+            # /usr/lib or substitute the host loader/libc into the guest.
+            for source, name, destination in files:
+                target = self.bind(source, name)
+                entries.append(f'lxc.mount.entry = {target} run/rocknix-fex/{destination} none bind,ro,nosuid,nodev,create=file 0 0')
+        return root, '\n'.join(entries) + '\n'
+
+    def close(self):
+        for target in reversed(self.bound):
+            subprocess.run(['/usr/bin/umount', str(target)], check=True)
+        self.bound.clear()
+        if self.audio is not None:
+            self.audio.close()
+            self.audio = None
+        if self.access is not None:
+            self.access.close()
+            self.access = None
+        self.recover(self.tools, self.state)
+
+    @staticmethod
+    def recover(tools, state):
+        state = Path(state)
+        AUDIO['AudioBridge'].recover()
+        access = state / 'desktop-access'
+        if access.exists():
+            ACCESS['AccessLease'](tools, access).close()
+        lock = state / 'desktop-access.lock'
+        if lock.exists():
+            info = lock.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600:
+                raise RuntimeError('unsafe desktop access lock')
+            lock.unlink()
+        directory = state / 'desktop-mounts'
+        if directory.exists():
+            mounts = {line.split()[4] for line in Path('/proc/self/mountinfo').read_text().splitlines()}
+            for path in directory.iterdir():
+                native_gallium = re.fullmatch(r'native-libgallium-[0-9]+(?:\.[0-9]+)+\.so', path.name)
+                gamepad = re.fullmatch(r'gamepad-event[0-9]+(?:-udev)?', path.name)
+                if (path.name not in STAGES and not native_gallium and not gamepad) or str(path) in mounts:
+                    raise RuntimeError('unexpected or still-mounted desktop staging path')
+                info = path.lstat()
+                if info.st_uid != 0:
+                    raise RuntimeError('unexpected desktop staging owner')
+                if stat.S_ISDIR(info.st_mode):
+                    path.rmdir()
+                elif stat.S_ISREG(info.st_mode):
+                    path.unlink()
+                else:
+                    raise RuntimeError('unexpected desktop staging type')
+            directory.rmdir()
+
+
+def session_environment(values):
+    """Only sizing/device UI values are imported from the host launcher."""
+    numeric = ('LOGICAL_WIDTH', 'LOGICAL_HEIGHT', 'BAR_HEIGHT', 'BAR_FONT_SIZE',
+               'STATUS_FONT_SIZE', 'BAR_PADDING', 'KEYBOARD_HEIGHT', 'KEYBOARD_FONT_SIZE',
+               'DISPLAY_PPI', 'LAUNCHER_FONT_SIZE', 'LAUNCHER_LINE_HEIGHT',
+               'LAUNCHER_HORIZONTAL_PAD', 'LAUNCHER_VERTICAL_PAD')
+    result = []
+    for suffix in (*numeric, 'OUTPUT_NAME', 'OUTPUT_SCALE'):
+        key = 'ROCKNIX_' + suffix
+        if key not in values:
+            continue
+        value = values[key]
+        pattern = r'[0-9]{1,5}' if suffix in numeric else r'[A-Za-z0-9_.:-]{1,64}'
+        if not re.fullmatch(pattern, value):
+            raise RuntimeError(f'invalid session environment: {key}')
+        result.append(f'{key}={value}')
+    if 'TZ' in values:
+        if not re.fullmatch(r'[A-Za-z0-9_+/-]{1,64}', values['TZ']):
+            raise RuntimeError('invalid session timezone')
+        result.append('TZ=' + values['TZ'])
+    return '\n'.join(result) + '\n'

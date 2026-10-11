@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Steam games
+Comment=Launch installed games in native gamescope
+Exec=/usr/local/bin/rocknix-games
+Icon=/usr/share/icons/Adwaita/scalable/devices/input-gaming.svg
+Categories=Game;
+Terminal=false

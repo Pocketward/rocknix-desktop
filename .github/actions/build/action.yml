@@ -1,0 +1,120 @@
+name: Build Desktop LXC
+description: Build, assemble and upload the Desktop LXC bundle and its checksum.
+runs:
+  using: composite
+  steps:
+  - name: Locate product source
+    id: project
+    shell: bash
+    run: printf "root=%s\n" "$(realpath "$GITHUB_ACTION_PATH/../../..")" >> "$GITHUB_OUTPUT"
+  - name: Compute archive cache keys
+    id: keys
+    run: python3 scripts/component-cache.py keys
+    shell: bash
+    working-directory: ${{ steps.project.outputs.root }}
+  - name: Cache guest-base archive
+    uses: actions/cache@v4
+    with:
+      path: ${{ steps.project.outputs.root }}/build/actions-cache/guest-base
+      key: archive-v2-${{ runner.os }}-${{ runner.arch }}-guest-base-${{ steps.keys.outputs['guest-base'] }}
+  - name: Cache host-runtime archive
+    uses: actions/cache@v4
+    with:
+      path: ${{ steps.project.outputs.root }}/build/actions-cache/host-runtime
+      key: archive-v2-${{ runner.os }}-${{ runner.arch }}-host-runtime-${{ steps.keys.outputs['host-runtime'] }}
+  - name: Cache firefox-media archive
+    uses: actions/cache@v4
+    with:
+      path: ${{ steps.project.outputs.root }}/build/actions-cache/firefox-media
+      key: archive-v2-${{ runner.os }}-${{ runner.arch }}-firefox-media-${{ steps.keys.outputs['firefox-media'] }}
+  - name: Cache mpv-media archive
+    uses: actions/cache@v4
+    with:
+      path: ${{ steps.project.outputs.root }}/build/actions-cache/mpv-media
+      key: archive-v2-${{ runner.os }}-${{ runner.arch }}-mpv-media-${{ steps.keys.outputs['mpv-media'] }}
+  - name: Cache fuzzel archive
+    uses: actions/cache@v4
+    with:
+      path: ${{ steps.project.outputs.root }}/build/actions-cache/fuzzel
+      key: archive-v2-${{ runner.os }}-${{ runner.arch }}-fuzzel-${{ steps.keys.outputs['fuzzel'] }}
+  - name: Cache keyboard archive
+    uses: actions/cache@v4
+    with:
+      path: ${{ steps.project.outputs.root }}/build/actions-cache/keyboard
+      key: archive-v2-${{ runner.os }}-${{ runner.arch }}-keyboard-${{ steps.keys.outputs['keyboard'] }}
+  - name: Cache xwayland archive
+    uses: actions/cache@v4
+    with:
+      path: ${{ steps.project.outputs.root }}/build/actions-cache/xwayland
+      key: archive-v2-${{ runner.os }}-${{ runner.arch }}-xwayland-${{ steps.keys.outputs['xwayland'] }}
+  - name: Cache integration archive
+    uses: actions/cache@v4
+    with:
+      path: ${{ steps.project.outputs.root }}/build/actions-cache/integration
+      key: archive-v2-${{ runner.os }}-${{ runner.arch }}-integration-${{ steps.keys.outputs['integration'] }}
+  - name: Cache trash-packages archive
+    uses: actions/cache@v4
+    with:
+      path: ${{ steps.project.outputs.root }}/build/actions-cache/trash-packages
+      key: archive-v2-${{ runner.os }}-${{ runner.arch }}-trash-packages-${{ steps.keys.outputs['trash-packages'] }}
+  - name: Restore finished archives and resolve misses
+    id: components
+    run: |
+      python3 scripts/component-cache.py restore
+      python3 scripts/build-components.py --plan
+    shell: bash
+    working-directory: ${{ steps.project.outputs.root }}
+  - name: Install archive ownership support
+    run: sudo apt-get update && sudo apt-get install -y fakeroot
+    shell: bash
+    working-directory: ${{ steps.project.outputs.root }}
+  - name: Set up builder only for missing compiled components
+    if: steps.components.outputs.needs_docker == 'true'
+    uses: docker/setup-buildx-action@v3
+  - name: Expose BuildKit cache service to the component builder
+    if: steps.components.outputs.needs_docker == 'true'
+    uses: actions/github-script@v7
+    with:
+      script: |
+        for (const name of ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL', 'ACTIONS_CACHE_URL']) {
+          if (process.env[name]) {
+            if (name.endsWith('TOKEN')) core.setSecret(process.env[name]);
+            core.exportVariable(name, process.env[name]);
+          }
+        }
+  - name: Build only missing components
+    run: python3 scripts/build-components.py
+    shell: bash
+    working-directory: ${{ steps.project.outputs.root }}
+  - name: Stage finished archives for Actions cache
+    run: python3 scripts/component-cache.py stage
+    shell: bash
+    working-directory: ${{ steps.project.outputs.root }}
+  - name: Package Desktop LXC
+    run: |
+      fakeroot -- python3 scripts/package-components.py \
+        --manifest dist/components/release.json --store build/component-store \
+        --output dist/rocknix-desktop-rp6-arm64.tar.xz
+      cd dist
+      sha256sum rocknix-desktop-rp6-arm64.tar.xz > rocknix-desktop-rp6-arm64.tar.xz.sha256
+    shell: bash
+    working-directory: ${{ steps.project.outputs.root }}
+  - name: Upload Desktop LXC bundle
+    uses: actions/upload-artifact@v4
+    with:
+      name: desktop-lxc-bundle
+      path: |-
+        ${{ steps.project.outputs.root }}/dist/rocknix-desktop-rp6-arm64.tar.xz
+        ${{ steps.project.outputs.root }}/dist/rocknix-desktop-rp6-arm64.tar.xz.sha256
+      if-no-files-found: error
+  - name: Record component timings
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: component-build-timings
+      path: |-
+        ${{ steps.project.outputs.root }}/dist/components/plan.json
+        ${{ steps.project.outputs.root }}/dist/components/timings.json
+        ${{ steps.project.outputs.root }}/dist/components/packaging-timings.json
+        ${{ steps.project.outputs.root }}/dist/components/release.json
+      if-no-files-found: ignore

@@ -1,0 +1,377 @@
+#!/usr/bin/python3
+"""Replace the LXC system from components, preserving private home/shared data.
+
+The old rootfs and host integration are retained only until activation succeeds.
+Interrupted activation rolls back before retrying the same checksum-bound input.
+"""
+import argparse
+import fcntl
+import grp
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import runpy
+import shutil
+import signal
+import stat
+import subprocess
+import tarfile
+import tempfile
+
+PROJECT = Path('/storage/rocknix-desktop')
+BASE = PROJECT / 'managed/host'
+DATA = PROJECT / 'data'
+ROOTFS = DATA / 'rootfs'
+WORKSPACE = BASE / 'state'
+GUARD = WORKSPACE / 'upgrade-in-progress.json'
+STATE = Path('/run/rocknix-lxc-upgrade')
+UNIT = Path('/storage/.config/system.d/rocknix-desktop.service')
+HOOK = Path('/storage/.config/autostart/999-rocknix-desktop')
+ENTRY = Path('/storage/.config/modules/Desktop Mode.sh')
+
+
+def helper_path(name):
+    directory = Path(__file__).absolute().parent
+    if Path(__file__).name == 'upgrade-lxc.py':
+        # The same updater is copied beside upgrade.sh in a bundle and in the
+        # installed host tree. Helpers themselves retain their payload/bin or
+        # bin locations; they are never read from the guest rootfs.
+        directory = directory / ('bin' if (directory / 'bin').is_dir() else 'payload/bin')
+    path = directory / name
+    safe_directory(directory)
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise RuntimeError('unsafe updater helper')
+    return path
+
+
+def select_layout(project):
+    """Require the complete canonical layout; never infer fresh guest data."""
+    host = project / 'managed/host'
+    if os.path.lexists(project / '.fresh-install.json'):
+        raise RuntimeError('finish the guarded fresh installation before updating')
+    if not all(os.path.lexists(path) for path in
+               (host, host / 'state', project / 'data/home')):
+        raise RuntimeError('incomplete Desktop storage layout; run Install to replace Desktop data')
+    if not os.path.lexists(project / 'data/rootfs') and not os.path.lexists(host / 'state/upgrade-in-progress.json'):
+        raise RuntimeError('missing Desktop rootfs')
+    return host, project / 'data', host / 'state', host / 'state/upgrade-in-progress.json'
+
+
+def configure_layout():
+    global BASE, DATA, ROOTFS, WORKSPACE, GUARD
+    BASE, DATA, WORKSPACE, GUARD = select_layout(PROJECT)
+    for path in (BASE, DATA, WORKSPACE):
+        safe_directory(path)
+    ROOTFS = DATA / 'rootfs'
+
+
+def integration_bytes(source):
+    """Render trusted native integration for the selected installation only."""
+    content = source.read_bytes()
+    content = content.replace(str(PROJECT / 'data/rootfs').encode(), str(ROOTFS).encode())
+    return content.replace(str(PROJECT / 'managed/host').encode(), str(BASE).encode())
+
+
+def safe_directory(path):
+    for item in (path, *path.parents):
+        info = item.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise RuntimeError(f'unsafe host directory: {item}')
+
+
+def no_mounts(path):
+    for line in Path('/proc/self/mountinfo').read_text().splitlines():
+        mount = line.split()[4].replace('\\040', ' ')
+        if mount == str(path) or mount.startswith(str(path) + '/'):
+            raise RuntimeError(f'mounted data under {path}; recover the runtime first')
+
+
+def validate_existing_storage(base):
+    """Already-mapped LXC data is never recursively re-owned during updates."""
+    safe_directory(base)
+    for name, owner in (('rootfs', 200000), ('home', 201000)):
+        info = (base / name).lstat()
+        if not stat.S_ISDIR(info.st_mode) or (info.st_uid, info.st_gid) != (owner, owner):
+            raise RuntimeError(f'expected mapped LXC {name} directory owned by {owner}')
+    # Descendants legitimately include service accounts, guest-root-owned home
+    # files and additional guest users. Their ownership is not ours to rewrite.
+
+
+def retained_marker(host):
+    marker = host / 'state/uninstalled.json'
+    if not os.path.lexists(marker):
+        return None
+    safe_directory(marker.parent)
+    info = marker.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise RuntimeError('unsafe retained-installation marker')
+    record = json.loads(marker.read_text())
+    if record.get('format') != 1 or record.get('phase') != 'removed':
+        raise RuntimeError('finish interrupted uninstall before reinstalling')
+    if set(record.get('files', {})) != {str(HOOK), str(ENTRY), str(UNIT)} or \
+            any(not isinstance(value, str) or not re.fullmatch('[0-9a-f]{64}', value)
+                for value in record['files'].values()):
+        raise RuntimeError('invalid retained integration record')
+    # A clean reinstall must not overwrite a replacement supplied by the user.
+    # Interrupted updates instead follow their existing checksum-bound journal.
+    if not os.path.lexists(GUARD):
+        for path in (HOOK, ENTRY, UNIT):
+            if os.path.lexists(path):
+                raise RuntimeError(f'integration appeared after uninstall: {path}')
+    return marker
+
+
+def idle():
+    maintenance = runpy.run_path(str(helper_path('rocknix-desktop-maintenance')))
+    maintenance['require_games_idle']()
+    desktop = subprocess.run(
+        ['systemctl', 'show', '--property=ActiveState', '--value', 'rocknix-desktop.service'],
+        capture_output=True, text=True, check=True)
+    if desktop.stdout.strip() != 'inactive':
+        raise RuntimeError('Desktop Mode must be fully inactive before updating')
+    for unit in ('sway.service', 'essway.service'):
+        subprocess.run(['systemctl', 'is-active', '--quiet', unit], check=True)
+    no_mounts(BASE)
+    if DATA != BASE:
+        no_mounts(DATA)
+
+
+def atomic(path, data, mode=0o644):
+    safe_directory(path.parent)
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise RuntimeError(f'unsafe managed host destination: {path}')
+    fd, name = tempfile.mkstemp(prefix='.rocknix-update-', dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            os.fchmod(stream.fileno(), mode)
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def extract(bundle, expected, target, assembled=None, components=None):
+    """Consume a checksum-verified, CI-assembled system archive."""
+    with bundle.open('rb') as stream:
+        if hashlib.file_digest(stream, 'sha256').hexdigest() != expected:
+            raise RuntimeError('system archive checksum mismatch')
+    if assembled is None:
+        assembled = target / 'system-candidate'
+        assembled.mkdir()
+        subprocess.run(['tar', '-xJf', str(bundle), '--numeric-owner', '-C', str(assembled)], check=True)
+    else:
+        # Consume the root-owned candidate already extracted by install.sh.
+        assembled = assembled.absolute()
+        safe_directory(assembled)
+        no_mounts(assembled)
+        if assembled == target or assembled in target.parents or target in assembled.parents:
+            raise RuntimeError('overlapping system staging paths')
+    components = components or runpy.run_path(str(helper_path('rocknix-components')))
+    value = components['release'](json.loads((assembled / 'components.json').read_text()))
+    if validate_candidate(assembled) != value['commit']:
+        raise RuntimeError('system archive manifest mismatch')
+    for source in assembled.iterdir():
+        source.rename(target / source.name)
+    assembled.rmdir()
+    revision = validate_candidate(target)
+    if (target / 'rootfs/etc/rocknix-desktop-build-info').read_bytes() != (target / 'build-info').read_bytes():
+        raise RuntimeError('replacement rootfs provenance mismatch')
+    return revision
+
+
+def validate_candidate(target):
+    safe_directory(target / 'payload')
+    safe_directory(target / 'host-tools')
+    if not (target / 'payload/bin/rocknix-desktop-paths').is_file():
+        raise RuntimeError('candidate is missing required Desktop paths')
+    metadata = (target / 'build-info').read_text()
+    revision = re.search(r'^commit=([0-9a-f]{40})$', metadata, re.M)
+    if not revision or 'architecture=arm64\n' not in metadata:
+        raise RuntimeError('invalid candidate provenance')
+    with tarfile.open(target / 'desktop-integration.tar.gz') as integration:
+        release = integration.extractfile('etc/rocknix-desktop-release').read().decode()
+        info = integration.extractfile('etc/rocknix-desktop-build-info').read().decode()
+        if 'ROCKNIX_LXC_RUNTIME=1\n' not in release or info != metadata:
+            raise RuntimeError('candidate is not a matching LXC integration build')
+    return revision[1]
+
+
+def remove_stage(path):
+    if path.parent != WORKSPACE or not path.name.startswith('upgrade-lxc.'):
+        raise RuntimeError('unrecognized update staging path')
+    safe_directory(path)
+    no_mounts(path)
+    shutil.rmtree(path)
+
+
+def prune_host_files(destination, names):
+    """Drop retired files only in a validated, project-managed payload directory."""
+    obsolete = [path for path in destination.iterdir() if path.name not in names]
+    for path in obsolete:
+        if path.is_symlink() or not path.is_file() or os.path.ismount(path):
+            raise RuntimeError('unexpected obsolete host payload member: ' + str(path))
+    for path in obsolete:
+        path.unlink()
+
+
+def install_host(candidate, preserve_candidate=False):
+    """Replace only the known host-managed files; never rootfs/home/logs."""
+    profile_api = runpy.run_path(str(candidate / 'payload/bin/rocknix-device-profile'))
+    profile = profile_api['resolve'](os.environ.get('ROCKNIX_UNTESTED_DEVICE_CONFIRMED') == '1')
+    tools = BASE / 'host-tools'
+    if tools.exists() or tools.is_symlink():
+        safe_directory(tools)
+        no_mounts(tools)
+        shutil.rmtree(tools)
+    if preserve_candidate:
+        shutil.copytree(candidate / 'host-tools', tools, symlinks=True)
+    else:
+        (candidate / 'host-tools').rename(tools)
+    for directory in ('bin', 'input', 'integration'):
+        destination = BASE / directory
+        destination.mkdir(exist_ok=True)
+        safe_directory(destination)
+        for source in (candidate / 'payload' / directory).iterdir():
+            if not source.is_file() or source.is_symlink():
+                raise RuntimeError('unexpected host payload member')
+            data = integration_bytes(source) if directory == 'integration' else source.read_bytes()
+            atomic(destination / source.name, data, 0o644 if directory == 'input' else 0o755)
+        prune_host_files(destination, {source.name for source in
+                                     (candidate / 'payload' / directory).iterdir()})
+    # This shared sizing helper also runs on the host before nested Steam starts.
+    guest_helpers = BASE / 'guest'
+    guest_helpers.mkdir(exist_ok=True)
+    safe_directory(guest_helpers)
+    sizing = candidate / 'payload/guest/rocknix-gamescope'
+    if not sizing.is_file() or sizing.is_symlink():
+        raise RuntimeError('missing trusted Gamescope sizing helper')
+    atomic(guest_helpers / sizing.name, sizing.read_bytes(), 0o755)
+    for name in ('README.md', 'uninstall.sh', 'upgrade.sh', 'upgrade-lxc.py', 'build-info'):
+        atomic(BASE / name, (candidate / name).read_bytes())
+    for source, destination, mode in (
+        (candidate / 'payload/systemd/rocknix-desktop.service', UNIT, 0o644),
+        (BASE / 'integration/999-rocknix-desktop', HOOK, 0o755),
+        (BASE / 'integration/Desktop Mode.sh', ENTRY, 0o755)):
+        atomic(destination, integration_bytes(source), mode)
+    subprocess.run(['systemctl', 'daemon-reload'], check=True)
+    profile_api['save_consent'](profile, atomic, BASE / 'state/device.json')
+    subprocess.run(['systemd-analyze', 'verify', str(UNIT)], check=True)
+    subprocess.run([str(BASE / 'bin/rocknix-tools-metadata')], check=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--bundle', type=Path, required=True)
+    parser.add_argument('--sha256', required=True)
+    parser.add_argument('--assembled', type=Path, help='trusted installer staging, consumed by --yes')
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--check', action='store_true')
+    mode.add_argument('--yes', action='store_true')
+    args = parser.parse_args()
+    if os.geteuid() != 0 or os.uname().machine != 'aarch64':
+        raise RuntimeError('requires ARM64 ROCKNIX host root')
+    runpy.run_path(str(helper_path('rocknix-device-profile')))['require_identity'](
+        os.environ.get('ROCKNIX_UNTESTED_DEVICE_CONFIRMED') == '1')
+    if not re.search(r'^OS_NAME=[\"\']?ROCKNIX[\"\']?$', Path('/etc/os-release').read_text(), re.M):
+        raise RuntimeError('requires ROCKNIX')
+    if not re.fullmatch('[0-9a-f]{64}', args.sha256):
+        raise RuntimeError('provide the trusted build checksum')
+    runpy.run_path(str(helper_path('rocknix-install-power')))['require_power']()
+    if any(200000 <= item.pw_uid < 265536 for item in pwd.getpwall()) or \
+            any(200000 <= item.gr_gid < 265536 for item in grp.getgrall()):
+        raise RuntimeError('container identity range conflicts with native accounts')
+    fd = os.open('/storage/.rocknix-desktop-install.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as lock:
+        info = os.fstat(lock.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or info.st_nlink != 1:
+            raise RuntimeError('unsafe shared installation lock')
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        configure_layout()
+        idle()
+        components = runpy.run_path(str(helper_path('rocknix-components')))
+        storage = runpy.run_path(str(helper_path('rocknix-lxc-storage')))
+        replacement_api = runpy.run_path(str(helper_path('rocknix-lxc-replace')))
+        transaction = replacement_api['Replacement'](globals())
+        if transaction.load(args.sha256):
+            if args.check:
+                raise RuntimeError('interrupted update requires --yes recovery')
+            work = transaction.work
+            api = runpy.run_path(str(work / 'payload/bin/rocknix-lxc'))
+            if STATE.exists():
+                api['Runtime'](work / 'host-tools', work / 'rootfs', STATE,
+                               recovery_only=True).recover()
+            transaction.rollback()
+            committed = transaction.record['phase'] == 'committed'
+            transaction.finish()
+            if committed:
+                print('Component update cleanup complete; home and shared files preserved.')
+                return
+        elif STATE.exists():
+            raise RuntimeError('unrecognized maintenance runtime requires recovery')
+        validate_existing_storage(DATA)
+        retained_marker(BASE)
+        candidate = Path(tempfile.mkdtemp(prefix='upgrade-lxc.', dir=WORKSPACE))
+        runtime = None
+        try:
+            revision = extract(args.bundle, args.sha256, candidate,
+                               args.assembled if args.yes else None, components)
+            storage['shift_rootfs'](candidate / 'rootfs', dry_run=True)
+            print(f'Candidate: {revision}; replacing system packages and system settings; '
+                  'preserving home and shared files.', flush=True)
+            if args.check:
+                return
+            storage['shift_rootfs'](candidate / 'rootfs')
+            transaction.prepare(candidate, args.sha256, revision)
+            api = runpy.run_path(str(candidate / 'payload/bin/rocknix-lxc'))
+            runtime = api['Runtime'](candidate / 'host-tools', candidate / 'rootfs', STATE)
+            runtime.start()
+            result = runtime.attach('/usr/bin/python3', '-', timeout=120,
+                input=(candidate / 'payload/guest/check-container.py').read_text())
+            if result.returncode:
+                raise RuntimeError('replacement container is invalid: ' + result.stdout + result.stderr)
+            runtime.close()
+            runtime = None
+            no_mounts(candidate)
+            transaction.activate()
+            # Keep trusted candidate tools available for interruption recovery.
+            install_host(candidate, preserve_candidate=True)
+            subprocess.run([str(BASE / 'bin/preflight')], check=True,
+                           env={**os.environ, 'ROCKNIX_UPGRADE_CHECK': '1'})
+            validate_existing_storage(DATA)
+            os.sync()
+            transaction.save('committed')
+            transaction.finish()
+            print('Component update complete. Home and shared files preserved; '
+                  'open Tools > Desktop Mode.', flush=True)
+        except BaseException:
+            if runtime is not None:
+                runtime.close()
+                runtime = None
+            if os.path.lexists(GUARD) and transaction.record and transaction.record['phase'] != 'committed':
+                transaction.rollback()
+                transaction.finish()
+            raise
+        finally:
+            if not os.path.lexists(GUARD) and candidate.exists():
+                remove_stage(candidate)
+            elif os.path.lexists(GUARD):
+                print('Update guarded; rerun with the same component manifest to recover.', flush=True)
+
+
+if __name__ == '__main__':
+    def interrupted(signum, frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    main()

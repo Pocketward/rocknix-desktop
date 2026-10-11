@@ -1,0 +1,8 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+
+source "$(dirname -- "${BASH_SOURCE[0]}")/rocknix-desktop-paths"
+"${BASE}/bin/rocknix-input-session" begin
+
+printf 'Desktop input enabled: right stick pointer, L2 left click, R2 right click\n'

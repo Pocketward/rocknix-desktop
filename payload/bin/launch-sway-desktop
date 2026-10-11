@@ -1,0 +1,481 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+
+source /etc/profile
+
+source "$(dirname -- "${BASH_SOURCE[0]}")/rocknix-desktop-paths"
+# Hold a shared lifetime lock so an installer cannot pass its idle check while
+# this launcher is starting. Updates/uninstall take the exclusive lock.
+[ ! -L /storage/.rocknix-desktop-install.lock ] || exit 1
+exec 9<>/storage/.rocknix-desktop-install.lock
+python3 - <<'PY'
+import os, stat
+info = os.fstat(9)
+assert stat.S_ISREG(info.st_mode) and info.st_uid == 0
+assert not info.st_mode & 0o022 and info.st_nlink == 1
+PY
+flock -n -s 9 || { printf 'Desktop maintenance is running; try again after it finishes.\n' >&2; exit 1; }
+LOG="${LOG_DIR}/session.log"
+RUNTIME_DIR=/run/rocknix-desktop
+SESSION_STATE=/run/rocknix-desktop-session-state
+CONTROL_FIFO="${RUNTIME_DIR}/control"
+HOST_CONTROL_FIFO="${RUNTIME_DIR}/host-control"
+SWAY_STYLE_MARKER="${RUNTIME_DIR}/sway-style-owned"
+DESKTOP_WORKSPACE='98:Desktop'
+DEVICE_MODEL=""
+if [ -r /proc/device-tree/model ]; then
+  DEVICE_MODEL=$(tr -d '\000' </proc/device-tree/model)
+fi
+HOST_CONTROL_PID=""
+WINDOW_WATCH_PID=""
+NETWORK_WATCH_PID=""
+BINDING_INSTALLED=0
+OUTPUT_NAME=""
+LOGICAL_WIDTH=0
+LOGICAL_HEIGHT=0
+OUTPUT_SCALE=""
+OUTPUT_PIXEL_WIDTH=0
+OUTPUT_PIXEL_HEIGHT=0
+DISPLAY_DIAGONAL_TENTHS=0
+DISPLAY_PPI=0
+BAR_HEIGHT=0
+BAR_FONT_SIZE=0
+STATUS_FONT_SIZE=0
+BAR_PADDING=0
+KEYBOARD_HEIGHT=0
+KEYBOARD_FONT_SIZE=0
+LAUNCHER_FONT_SIZE=0
+LAUNCHER_LINE_HEIGHT=0
+LAUNCHER_HORIZONTAL_PAD=0
+LAUNCHER_VERTICAL_PAD=0
+SWAY_TITLE_FONT_POINTS=0
+SWAY_TITLE_HORIZONTAL_PADDING=0
+SWAY_TITLE_VERTICAL_PADDING=0
+
+discover_sway_environment() {
+  local candidate
+
+  export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/var/run/0-runtime-dir}"
+
+  if [ -z "${SWAYSOCK:-}" ] || [ ! -S "${SWAYSOCK}" ]; then
+    unset SWAYSOCK
+    for candidate in "${XDG_RUNTIME_DIR}"/sway-ipc.*.sock; do
+      if [ -S "${candidate}" ]; then
+        export SWAYSOCK="${candidate}"
+        break
+      fi
+    done
+  fi
+
+  if [ -z "${WAYLAND_DISPLAY:-}" ] || [ ! -S "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" ]; then
+    unset WAYLAND_DISPLAY
+    for candidate in "${XDG_RUNTIME_DIR}"/wayland-*; do
+      if [ -S "${candidate}" ]; then
+        export WAYLAND_DISPLAY="${candidate##*/}"
+        break
+      fi
+    done
+  fi
+
+  [ -n "${SWAYSOCK:-}" ] || { printf 'Cannot find the Sway IPC socket\n' >&2; exit 1; }
+  [ -n "${WAYLAND_DISPLAY:-}" ] || { printf 'Cannot find the Wayland socket\n' >&2; exit 1; }
+}
+
+discover_output_metrics() {
+  local metrics maximum_keyboard physical_metrics
+  DISPLAY_DIAGONAL_TENTHS=0
+
+  metrics=$(swaymsg -r -t get_outputs | jq -er '
+    ([.[] | select(.active and .focused)] + [.[] | select(.active)])[0]
+    | [
+        .name,
+        (.rect.width | floor),
+        (.rect.height | floor),
+        (.scale | tostring),
+        (.current_mode.width | floor),
+        (.current_mode.height | floor)
+      ]
+    | @tsv
+  ')
+  IFS=$'\t' read -r \
+    OUTPUT_NAME LOGICAL_WIDTH LOGICAL_HEIGHT OUTPUT_SCALE \
+    OUTPUT_PIXEL_WIDTH OUTPUT_PIXEL_HEIGHT <<<"${metrics}"
+  [[ "${OUTPUT_NAME}" != *$'\n'* && -n "${OUTPUT_NAME}" ]] || return 1
+  [[ "${LOGICAL_WIDTH}" =~ ^[0-9]+$ && "${LOGICAL_HEIGHT}" =~ ^[0-9]+$ && \
+    "${OUTPUT_PIXEL_WIDTH}" =~ ^[0-9]+$ && "${OUTPUT_PIXEL_HEIGHT}" =~ ^[0-9]+$ ]] || return 1
+
+  # Sway omits physical dimensions, so use the tested RP6 panel hint only on DSI-1.
+  case "${DEVICE_MODEL}:${OUTPUT_NAME}" in
+    'Retroid Pocket 6:DSI-1') DISPLAY_DIAGONAL_TENTHS=55 ;;
+  esac
+
+  if [ "${DISPLAY_DIAGONAL_TENTHS}" -gt 0 ]; then
+    physical_metrics=$(awk \
+      -v pw="${OUTPUT_PIXEL_WIDTH}" \
+      -v ph="${OUTPUT_PIXEL_HEIGHT}" \
+      -v diagonal_tenths="${DISPLAY_DIAGONAL_TENTHS}" \
+      -v scale="${OUTPUT_SCALE}" \
+      -v logical_height="${LOGICAL_HEIGHT}" '
+        function clamp(value, minimum, maximum) {
+          return value < minimum ? minimum : (value > maximum ? maximum : value)
+        }
+        function rounded(value) { return int(value + 0.5) }
+        BEGIN {
+          if (scale <= 0 || diagonal_tenths <= 0) exit 1
+          ppi = sqrt((pw * pw) + (ph * ph)) / (diagonal_tenths / 10)
+          bar = clamp(ppi * 5.1 / 25.4 / scale, 44, 96)
+          if (bar > logical_height * 0.09) bar = logical_height * 0.09
+          printf "%d %d %d %d %d %d %d %d %d %d %d %d %d\n", \
+            rounded(ppi), \
+            rounded(bar), \
+            rounded(clamp(ppi * 1.9 / 25.4 / scale, 16, 32)), \
+            rounded(clamp(ppi * 1.65 / 25.4 / scale, 14, 28)), \
+            rounded(clamp(ppi * 1.5 / 25.4 / scale, 10, 26)), \
+            rounded(clamp(ppi * 2.0 / 25.4 / scale, 20, 34)), \
+            rounded(clamp(ppi * 1.9 / 25.4 / scale, 16, 32)), \
+            rounded(clamp(ppi * 5.6 / 25.4 / scale, 40, 92)), \
+            rounded(clamp(ppi * 1.5 / 25.4 / scale, 12, 28)), \
+            rounded(clamp(ppi * 1.2 / 25.4 / scale, 10, 24)), \
+            rounded(clamp(ppi * 1.5 / 25.4 / scale * 0.75, 12, 20)), \
+            rounded(clamp(ppi * 1.2 / 25.4 / scale, 10, 20)), \
+            rounded(clamp(ppi * 0.6 / 25.4 / scale, 6, 12))
+        }
+      ') || return 1
+    read -r \
+      DISPLAY_PPI BAR_HEIGHT BAR_FONT_SIZE STATUS_FONT_SIZE BAR_PADDING \
+      KEYBOARD_FONT_SIZE LAUNCHER_FONT_SIZE LAUNCHER_LINE_HEIGHT \
+      LAUNCHER_HORIZONTAL_PAD LAUNCHER_VERTICAL_PAD \
+      SWAY_TITLE_FONT_POINTS SWAY_TITLE_HORIZONTAL_PADDING \
+      SWAY_TITLE_VERTICAL_PADDING <<<"${physical_metrics}"
+  else
+    BAR_HEIGHT=$((LOGICAL_HEIGHT * 6 / 100))
+    [ "${BAR_HEIGHT}" -ge 48 ] || BAR_HEIGHT=48
+    [ "${BAR_HEIGHT}" -le 64 ] || BAR_HEIGHT=64
+
+    if [ "${LOGICAL_HEIGHT}" -le 540 ]; then
+      BAR_FONT_SIZE=16
+      STATUS_FONT_SIZE=14
+      BAR_PADDING=10
+      LAUNCHER_FONT_SIZE=16
+      LAUNCHER_LINE_HEIGHT=38
+      LAUNCHER_HORIZONTAL_PAD=12
+      LAUNCHER_VERTICAL_PAD=10
+      SWAY_TITLE_FONT_POINTS=12
+    elif [ "${LOGICAL_HEIGHT}" -le 800 ]; then
+      BAR_FONT_SIZE=18
+      STATUS_FONT_SIZE=16
+      BAR_PADDING=12
+      LAUNCHER_FONT_SIZE=18
+      LAUNCHER_LINE_HEIGHT=42
+      LAUNCHER_HORIZONTAL_PAD=14
+      LAUNCHER_VERTICAL_PAD=12
+      SWAY_TITLE_FONT_POINTS=14
+    else
+      BAR_FONT_SIZE=20
+      STATUS_FONT_SIZE=18
+      BAR_PADDING=14
+      LAUNCHER_FONT_SIZE=20
+      LAUNCHER_LINE_HEIGHT=48
+      LAUNCHER_HORIZONTAL_PAD=16
+      LAUNCHER_VERTICAL_PAD=14
+      SWAY_TITLE_FONT_POINTS=16
+    fi
+    SWAY_TITLE_HORIZONTAL_PADDING=10
+    SWAY_TITLE_VERTICAL_PADDING=6
+  fi
+
+  KEYBOARD_HEIGHT=$((LOGICAL_HEIGHT * 35 / 100))
+  [ "${KEYBOARD_HEIGHT}" -ge 180 ] || KEYBOARD_HEIGHT=180
+  [ "${KEYBOARD_HEIGHT}" -le 380 ] || KEYBOARD_HEIGHT=380
+  maximum_keyboard=$((LOGICAL_HEIGHT - BAR_HEIGHT - 160))
+  [ "${maximum_keyboard}" -ge 120 ] || maximum_keyboard=120
+  [ "${KEYBOARD_HEIGHT}" -le "${maximum_keyboard}" ] || KEYBOARD_HEIGHT=${maximum_keyboard}
+
+  if [ "${KEYBOARD_FONT_SIZE}" -eq 0 ]; then
+    KEYBOARD_FONT_SIZE=$((KEYBOARD_HEIGHT / 12))
+    [ "${KEYBOARD_FONT_SIZE}" -ge 20 ] || KEYBOARD_FONT_SIZE=20
+    [ "${KEYBOARD_FONT_SIZE}" -le 32 ] || KEYBOARD_FONT_SIZE=32
+  fi
+}
+
+window_count_loop() {
+  exec env ROCKNIX_BAR_HEIGHT="${BAR_HEIGHT}" "${BASE}/bin/rocknix-window-policy"
+}
+
+host_control_loop() {
+  local command
+  local -a words
+  exec 8<>"${HOST_CONTROL_FIFO}"
+
+  while :; do
+    command=""
+    if IFS= read -r -t 1 -n 512 command <&8; then
+      case "${command}" in
+        next) "${BASE}/bin/rocknix-window-cycle" >/dev/null ;;
+        layout) swaymsg 'layout toggle tabbed splith' >/dev/null ;;
+        keyboard) "${BASE}/bin/rocknix-keyboard-toggle" >/dev/null ;;
+        network) "${BASE}/bin/rocknix-network" & ;;
+        games\ *)
+          read -r -a words <<<"${command}"
+          "${BASE}/bin/rocknix-games" request "${words[@]:1}" || true
+          ;;
+        display\ *)
+          read -r -a words <<<"${command}"
+          python3 "${BASE}/bin/rocknix-display-settings" request "${words[@]:1}" || true
+          ;;
+      esac
+    fi
+    "${BASE}/bin/rocknix-games" controls-tick || true
+    python3 "${BASE}/bin/rocknix-display-settings" tick || true
+    refresh_display_metrics || true
+    python3 "${BASE}/bin/rocknix-display-settings" publish || true
+  done
+}
+
+refresh_display_metrics() {
+  KEYBOARD_FONT_SIZE=0
+  discover_output_metrics || return 1
+  local names='OUTPUT_NAME LOGICAL_WIDTH LOGICAL_HEIGHT BAR_HEIGHT BAR_FONT_SIZE STATUS_FONT_SIZE BAR_PADDING KEYBOARD_HEIGHT KEYBOARD_FONT_SIZE LAUNCHER_FONT_SIZE LAUNCHER_LINE_HEIGHT LAUNCHER_HORIZONTAL_PAD LAUNCHER_VERTICAL_PAD'
+  local name
+  local -a values=()
+  for name in ${names}; do values+=("${name}" "${!name}"); done
+  python3 - "${RUNTIME_DIR}/display-metrics.json" "${values[@]}" <<'PY'
+import json, os, sys, tempfile
+from pathlib import Path
+path = Path(sys.argv[1])
+values = dict(zip(sys.argv[2::2], sys.argv[3::2]))
+data = {k: v if k == 'OUTPUT_NAME' else int(v) for k, v in values.items()}
+text = json.dumps(data, sort_keys=True) + '\n'
+if path.exists() and path.read_text() == text:
+    raise SystemExit(0)
+fd, temporary = tempfile.mkstemp(prefix='.metrics-', dir=path.parent)
+try:
+    with os.fdopen(fd, 'w') as stream:
+        stream.write(text)
+        os.fchmod(stream.fileno(), 0o644)
+    os.replace(temporary, path)
+finally:
+    if os.path.exists(temporary): os.unlink(temporary)
+PY
+}
+
+network_status_loop() {
+  while :; do
+    timeout 2 nmcli --terse --fields TYPE,STATE device status >"${RUNTIME_DIR}/network-state.new" 2>/dev/null || true
+    mv -f "${RUNTIME_DIR}/network-state.new" "${RUNTIME_DIR}/network-state"
+    sleep 5
+  done
+}
+
+mkdir -p "${LOG_DIR}" "${HOME_SOURCE}"
+if [ -f "${LOG}" ]; then
+  mv -f "${LOG}" "${LOG}.previous"
+fi
+: >"${LOG}"
+# Keep the service journal descriptors independent of the tee process, which
+# systemd can terminate before this shell runs its EXIT trap.
+exec {SESSION_STDOUT}>&1 {SESSION_STDERR}>&2
+exec > >(tee -a "${LOG}") 2>&1
+
+printf '%s Sway Desktop Mode session starting\n' "$(date -Is)"
+
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM HUP
+  exec 1>&${SESSION_STDOUT} 2>&${SESSION_STDERR}
+
+  if [ -n "${HOST_CONTROL_PID}" ]; then
+    kill -TERM "${HOST_CONTROL_PID}" 2>/dev/null || true
+  fi
+  if [ -n "${WINDOW_WATCH_PID}" ]; then
+    kill -TERM "${WINDOW_WATCH_PID}" 2>/dev/null || true
+  fi
+  if [ -n "${NETWORK_WATCH_PID}" ]; then
+    kill -TERM "${NETWORK_WATCH_PID}" 2>/dev/null || true
+  fi
+  if [ -f "${SWAY_STYLE_MARKER}" ] && systemctl is-active --quiet sway.service; then
+    swaymsg reload >/dev/null 2>&1 || true
+    rm -f "${SWAY_STYLE_MARKER}"
+  fi
+  if [ "${BINDING_INSTALLED}" = 1 ] && systemctl is-active --quiet sway.service; then
+    swaymsg 'unbindsym XF86Tools' >/dev/null 2>&1 || true
+    swaymsg 'unbindsym F13' >/dev/null 2>&1 || true
+    swaymsg 'unbindsym F14' >/dev/null 2>&1 || true
+    swaymsg 'unbindsym F15' >/dev/null 2>&1 || true
+    swaymsg 'unbindsym XF86Launch5' >/dev/null 2>&1 || true
+    swaymsg 'unbindsym XF86Launch6' >/dev/null 2>&1 || true
+    rm -f "${RUNTIME_DIR}/bindings-owned"
+  fi
+  rm -f \
+    "${RUNTIME_DIR}/keyboard-visible" \
+    "${RUNTIME_DIR}/window-count" \
+    "${RUNTIME_DIR}/window-count.new" \
+    "${RUNTIME_DIR}/workarea.json" \
+    "${RUNTIME_DIR}/workarea.json.new" \
+    "${RUNTIME_DIR}/network-state" \
+    "${RUNTIME_DIR}/network-state.new" \
+    "${HOST_CONTROL_FIFO}" \
+    "${RUNTIME_DIR}/keyboard-control" \
+    "${CONTROL_FIFO}"
+  rmdir "${RUNTIME_DIR}" 2>/dev/null || true
+
+  printf '%s Sway Desktop Mode session ended with status %s\n' "$(date -Is)" "${rc}"
+  exit "${rc}"
+}
+trap cleanup EXIT
+trap 'exit 143' TERM HUP
+trap 'exit 130' INT
+
+"${BASE}/bin/preflight"
+discover_sway_environment
+discover_output_metrics || { printf 'Cannot determine active output metrics\n' >&2; exit 1; }
+printf 'Desktop output: %s, %sx%s logical at scale %s, %sx%s physical pixels' \
+  "${OUTPUT_NAME}" "${LOGICAL_WIDTH}" "${LOGICAL_HEIGHT}" "${OUTPUT_SCALE}" \
+  "${OUTPUT_PIXEL_WIDTH}" "${OUTPUT_PIXEL_HEIGHT}"
+if [ "${DISPLAY_PPI}" -gt 0 ]; then
+  printf ', %s.%s-inch profile, ~%s ppi' \
+    "$((DISPLAY_DIAGONAL_TENTHS / 10))" "$((DISPLAY_DIAGONAL_TENTHS % 10))" "${DISPLAY_PPI}"
+fi
+printf '; panel %spx, keyboard %spx\n' "${BAR_HEIGHT}" "${KEYBOARD_HEIGHT}"
+
+PRIOR_WORKSPACE=$(swaymsg -r -t get_workspaces | jq -er '.[] | select(.focused).name')
+TOUCHKEYBOARD_ACTIVE=0
+if systemctl is-active --quiet touchkeyboard.service; then
+  TOUCHKEYBOARD_ACTIVE=1
+fi
+TOUCHKEYBOARD_MASK_OWNED=1
+case "$(systemctl is-enabled touchkeyboard.service 2>/dev/null || true)" in
+  masked|masked-runtime) TOUCHKEYBOARD_MASK_OWNED=0 ;;
+esac
+{
+  printf 'workspace=%s\n' "${PRIOR_WORKSPACE}"
+  printf 'touchkeyboard_active=%s\n' "${TOUCHKEYBOARD_ACTIVE}"
+  printf 'touchkeyboard_mask_owned=%s\n' "${TOUCHKEYBOARD_MASK_OWNED}"
+} >"${SESSION_STATE}.new"
+mv -f "${SESSION_STATE}.new" "${SESSION_STATE}"
+
+systemctl stop essway.service
+! systemctl is-active --quiet essway.service || { printf 'EmulationStation did not stop\n' >&2; exit 1; }
+systemctl is-active --quiet sway.service || { printf 'Sway stopped unexpectedly\n' >&2; exit 1; }
+
+if [ "${TOUCHKEYBOARD_MASK_OWNED}" = 1 ]; then
+  systemctl mask --runtime touchkeyboard.service
+fi
+systemctl stop touchkeyboard.service
+pkill -x wvkbd-mobintl 2>/dev/null || true
+
+"${BASE}/bin/configure-input"
+
+mkdir -p "${RUNTIME_DIR}"
+chmod 0755 "${RUNTIME_DIR}"
+"${BASE}/bin/rocknix-games" publish
+"${BASE}/bin/rocknix-games" controls-begin
+python3 "${BASE}/bin/rocknix-display-settings" begin "${OUTPUT_NAME}"
+refresh_display_metrics
+python3 "${BASE}/bin/rocknix-display-settings" publish
+rm -f -- "${CONTROL_FIFO}" "${HOST_CONTROL_FIFO}" "${RUNTIME_DIR}/keyboard-visible"
+mkfifo -m 0600 "${CONTROL_FIFO}"
+mkfifo -m 0600 "${HOST_CONTROL_FIFO}"
+rm -f "${RUNTIME_DIR}/keyboard-control"
+mkfifo -m 0640 "${RUNTIME_DIR}/keyboard-control"
+chown 0:201000 "${RUNTIME_DIR}/keyboard-control"
+chown 0:201000 "${CONTROL_FIFO}" "${HOST_CONTROL_FIFO}"
+chmod 0660 "${CONTROL_FIFO}"
+chmod 0620 "${HOST_CONTROL_FIFO}"
+
+# The private keyboard now starts inside the non-root session. Controller
+# requests pass through a fixed-command FIFO, never a user-supplied host PID.
+
+BINDING_INSTALLED=1
+touch "${RUNTIME_DIR}/bindings-owned"
+swaymsg -- "bindsym XF86Tools exec ${BASE}/bin/rocknix-keyboard-toggle" >/dev/null
+swaymsg -- "bindsym F13 exec ${BASE}/bin/rocknix-keyboard-toggle" >/dev/null
+swaymsg -- "bindsym --no-repeat F14 exec env SWAYSOCK=${SWAYSOCK} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR} ${BASE}/bin/rocknix-window-cycle" >/dev/null
+# Resolve a leaf window explicitly: Sway's focused-container criterion can also
+# match a parent. No-repeat prevents a held R3 from closing successive apps.
+swaymsg -- "bindsym --no-repeat F15 exec env SWAYSOCK=${SWAYSOCK} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR} ${BASE}/bin/rocknix-close-window" >/dev/null
+# The host evdev XKB map translates KEY_F14/F15 to these multimedia symbols.
+# Keep the plain aliases for hosts that retain the function-key symbols.
+swaymsg -- "bindsym --no-repeat XF86Launch5 exec env SWAYSOCK=${SWAYSOCK} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR} ${BASE}/bin/rocknix-window-cycle" >/dev/null
+swaymsg -- "bindsym --no-repeat XF86Launch6 exec env SWAYSOCK=${SWAYSOCK} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR} ${BASE}/bin/rocknix-close-window" >/dev/null
+
+# Mark ownership before the first temporary workspace-style mutation. If the
+# service is interrupted below, ExecStopPost will still reload the host config.
+touch "${SWAY_STYLE_MARKER}"
+swaymsg 'focus_follows_mouse no' >/dev/null
+swaymsg -- "workspace ${DESKTOP_WORKSPACE}" >/dev/null
+# A surviving floating utility can receive focus on workspace entry. Layout
+# commands target that focused view, and Sway rejects them for floating views.
+# Do not reapply a layout the workspace already has.
+if ! swaymsg -r -t get_tree | jq -e --arg name "${DESKTOP_WORKSPACE}" \
+  'any(.. | objects; .type? == "workspace" and .name? == $name and .layout? == "tabbed")' >/dev/null; then
+  swaymsg 'layout tabbed' >/dev/null
+fi
+
+# Art Book Next uses a #444 selection band over #111 fields. Apply that same
+# hierarchy to Sway's tab strip, then reload the device config during cleanup.
+swaymsg 'gaps inner current set 0' >/dev/null
+swaymsg 'gaps outer current set 0' >/dev/null
+if ! swaymsg 'hide_edge_borders --i3 smart' >/dev/null 2>&1; then
+  swaymsg 'smart_borders on' >/dev/null
+fi
+swaymsg -- "font pango:sans-serif ${SWAY_TITLE_FONT_POINTS}" >/dev/null
+swaymsg -- "titlebar_padding ${SWAY_TITLE_HORIZONTAL_PADDING} ${SWAY_TITLE_VERTICAL_PADDING}" >/dev/null
+swaymsg 'client.focused #444444 #444444 #ffffff #444444 #444444' >/dev/null
+swaymsg 'client.focused_inactive #111111 #111111 #aaaaaa #111111 #111111' >/dev/null
+swaymsg 'client.unfocused #111111 #111111 #777777 #111111 #111111' >/dev/null
+swaymsg 'client.urgent #444444 #444444 #ffffff #444444 #444444' >/dev/null
+swaymsg 'client.placeholder #000000 #000000 #777777 #000000 #000000' >/dev/null
+swaymsg 'client.background #000000' >/dev/null
+
+host_control_loop &
+HOST_CONTROL_PID=$!
+window_count_loop &
+WINDOW_WATCH_PID=$!
+network_status_loop &
+NETWORK_WATCH_PID=$!
+
+TZ_VALUE=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+TZ_VALUE=${TZ_VALUE:-UTC}
+DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}
+PULSE_SERVER=${PULSE_SERVER:-unix:${XDG_RUNTIME_DIR}/pulse/native}
+
+printf '%s Starting unprivileged LXC Desktop\n' "$(date -Is)"
+/usr/bin/env -i \
+  HOME=/home/rocknix \
+  USER=root \
+  LOGNAME=root \
+  SHELL=/bin/bash \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  LANG=C.UTF-8 \
+  LC_ALL=C.UTF-8 \
+  TZ="${TZ_VALUE}" \
+  XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR}" \
+  WAYLAND_DISPLAY="${WAYLAND_DISPLAY}" \
+  SWAYSOCK="${SWAYSOCK}" \
+  DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS}" \
+  DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket \
+  PULSE_SERVER="${PULSE_SERVER}" \
+  XDG_SESSION_TYPE=wayland \
+  XDG_CURRENT_DESKTOP=sway \
+  GDK_BACKEND=wayland \
+  QT_QPA_PLATFORM=wayland \
+  SDL_VIDEODRIVER=wayland \
+  MOZ_ENABLE_WAYLAND=1 \
+  ROCKNIX_OUTPUT_NAME="${OUTPUT_NAME}" \
+  ROCKNIX_LOGICAL_WIDTH="${LOGICAL_WIDTH}" \
+  ROCKNIX_LOGICAL_HEIGHT="${LOGICAL_HEIGHT}" \
+  ROCKNIX_OUTPUT_SCALE="${OUTPUT_SCALE}" \
+  ROCKNIX_BAR_HEIGHT="${BAR_HEIGHT}" \
+  ROCKNIX_BAR_FONT_SIZE="${BAR_FONT_SIZE}" \
+  ROCKNIX_STATUS_FONT_SIZE="${STATUS_FONT_SIZE}" \
+  ROCKNIX_BAR_PADDING="${BAR_PADDING}" \
+  ROCKNIX_KEYBOARD_HEIGHT="${KEYBOARD_HEIGHT}" \
+  ROCKNIX_KEYBOARD_FONT_SIZE="${KEYBOARD_FONT_SIZE}" \
+  ROCKNIX_DISPLAY_PPI="${DISPLAY_PPI}" \
+  ROCKNIX_LAUNCHER_FONT_SIZE="${LAUNCHER_FONT_SIZE}" \
+  ROCKNIX_LAUNCHER_LINE_HEIGHT="${LAUNCHER_LINE_HEIGHT}" \
+  ROCKNIX_LAUNCHER_HORIZONTAL_PAD="${LAUNCHER_HORIZONTAL_PAD}" \
+  ROCKNIX_LAUNCHER_VERTICAL_PAD="${LAUNCHER_VERTICAL_PAD}" \
+  "${BASE}/bin/rocknix-lxc" --tools "${BASE}/host-tools" --rootfs "${ROOTFS}" --desktop

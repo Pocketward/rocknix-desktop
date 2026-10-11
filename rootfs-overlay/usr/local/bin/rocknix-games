@@ -1,0 +1,104 @@
+#!/usr/bin/python3
+"""Guest menu for fixed native Steam requests; no host commands or paths."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+BRIDGE = Path('/run/rocknix-desktop')
+
+
+def menu(prompt, choices):
+    result = subprocess.run(['/usr/local/bin/rocknix-launcher', 'games-menu', prompt],
+        input='\n'.join(label for label, _ in choices) + '\n', text=True, capture_output=True)
+    if result.returncode:
+        return None
+    return next((value for label, value in choices if label == result.stdout.rstrip('\n')), None)
+
+
+def state():
+    return json.loads((BRIDGE / 'games.json').read_text())
+
+
+def send(*words):
+    data = ('games ' + ' '.join(words) + '\n').encode()
+    if len(data) > 480 or any('\n' in w or '\r' in w for w in words):
+        raise ValueError('invalid game request')
+    fd = os.open(BRIDGE / 'host-control', os.O_WRONLY | os.O_NONBLOCK)
+    try:
+        if os.write(fd, data) != len(data):
+            raise OSError('incomplete game request')
+    finally:
+        os.close(fd)
+
+
+def main():
+    if sys.argv[1:] == ['controls-status']:
+        try:
+            control = json.loads((BRIDGE / 'controller.json').read_text())
+            label = 'Game' if control['active'] == 'game' else 'Desktop'
+            print(json.dumps({'text': 'Pad: ' + label,
+                              'tooltip': 'Tap to switch Desktop/Game controls'}))
+        except (OSError, ValueError, KeyError):
+            print(json.dumps({'text': ''}))
+        return
+    if sys.argv[1:] == ['controls']:
+        send('controls-toggle')
+        return
+    send('refresh')
+    time.sleep(.3)
+    current = state()
+    if sys.argv[1:] == ['settings']:
+        selected = menu('Gamescope settings · applies to next launch', [
+            ('Virtual display · fit desktop: ' + ('On' if current.get('virtual_display', True) else 'Off · native monitor'), 'virtual-display'),
+            ('Close Desktop · native fullscreen' + (' · Current' if current['mode'] == 'close' else ''), 'close'),
+            ('Keep Desktop running' + (' · Current' if current['mode'] == 'keep' else ''), 'keep'),
+            ('Back', None)])
+        if selected:
+            key = 'virtual_display' if selected == 'virtual-display' else 'mode'
+            expected = not current.get('virtual_display', True) if key == 'virtual_display' else selected
+            if key == 'virtual_display':
+                send('virtual-display', 'on' if expected else 'off')
+            else:
+                send('mode', selected)
+            for _ in range(30):
+                time.sleep(.1)
+                if state().get(key) == expected:
+                    return
+            raise OSError('setting was not saved')
+        return
+    if current.get('busy'):
+        choices = [('Back', None)]
+        if current.get('session_mode') == 'keep':
+            choices.append(('Show Steam', 'show'))
+        choices.append(('Stop game and Steam', 'stop'))
+        selected = menu('A Steam session is running', choices)
+        if selected:
+            send(selected)
+            time.sleep(.3)
+            error = state().get('error')
+            if error:
+                menu(error, [('Back', None)])
+        return
+    selected = menu('ROCKNIX Steam games', [(g['name'], g['id']) for g in current['games']] + [('Back', None)])
+    if selected is None:
+        return
+    mode = current['mode']
+    if mode == 'close' and menu('Save your work · close Steam to return', [
+            ('Cancel', None), ('Close desktop apps and launch', 'launch')]) != 'launch':
+        return
+    send('launch', selected, mode)
+    # Closing Desktop tears this process down. Keep mode can display rejection.
+    time.sleep(1)
+    error = state().get('error')
+    if error:
+        menu(error, [('Back', None)])
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, KeyError):
+        menu('Games unavailable — reopen Desktop', [('Back', None)])

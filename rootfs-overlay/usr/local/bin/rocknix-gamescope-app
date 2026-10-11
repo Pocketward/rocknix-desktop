@@ -1,0 +1,43 @@
+#!/usr/bin/python3
+"""Fuzzel launch prefix: retain desktop-entry argv and report launch failures."""
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+
+def message(text):
+    subprocess.run(['/usr/local/bin/rocknix-launcher', 'games-menu', text],
+                   input='Back\n', text=True, check=False)
+
+
+def main(command):
+    if not command:
+        return
+    entry = os.environ.get('DESKTOP_ENTRY_ID', os.environ.get('FUZZEL_DESKTOP_FILE_ID', ''))
+    program = Path(command[0]).name
+    if entry == 'rocknix-gamescope.desktop':
+        # Selecting the picker in its own catalog simply returns to the picker.
+        os.execv('/usr/local/bin/rocknix-launcher', ['rocknix-launcher', 'gamescope-apps'])
+        return
+    if entry == 'rocknix-games.desktop' or program in ('rocknix-games', 'gamescope', 'rocknix-gamescope'):
+        message('This entry already manages Gamescope — open it from Apps')
+        return
+    if program == 'foot':
+        message('This terminal needs Wayland — open it from Apps')
+        return
+    logs = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'rocknix-desktop'
+    logs.mkdir(parents=True, exist_ok=True)
+    with (logs / 'gamescope-app.log').open('w') as stream:
+        result = subprocess.run(['/usr/local/bin/rocknix-gamescope', '--', *command],
+                                stdout=stream, stderr=subprocess.STDOUT, check=False)
+    if result.returncode:
+        message('Gamescope session failed — close the app and retry; see gamescope-app.log')
+
+
+if __name__ == '__main__':
+    try:
+        main(sys.argv[1:])
+    except OSError as error:
+        print(f'Gamescope launch failed: {error}', file=sys.stderr)
+        message('Gamescope launch unavailable — reopen Desktop and retry')

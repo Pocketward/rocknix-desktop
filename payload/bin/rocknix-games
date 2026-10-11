@@ -1,0 +1,388 @@
+#!/usr/bin/python3
+"""Host-owned native gamescope lifecycle, requested through the fixed FIFO bridge."""
+import configparser
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+BASE = Path(__file__).resolve().parent.parent
+STATE = BASE / 'state/games.json'
+PUBLIC = Path('/run/rocknix-desktop/games.json')
+LEASE = Path('/run/rocknix-desktop-games')
+UNIT = 'rocknix-desktop-games.service'
+SCOPE = 'steam-bigpicture.scope'
+SHORTCUTS = Path('/storage/.local/share/applications')
+MODES = ('close', 'keep')
+
+
+def run(*args, check=True, timeout=60):
+    return subprocess.run(args, check=check, timeout=timeout, capture_output=True, text=True)
+
+
+def active(unit):
+    return run('systemctl', 'is-active', '--quiet', unit, check=False).returncode == 0
+
+
+def atomic(path, value, mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as out:
+            json.dump(value, out)
+            out.flush()
+            os.fsync(out.fileno())
+            os.fchmod(out.fileno(), mode)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def shortcuts():
+    # Same directory and file type as ROCKNIX's EmulationStation Steam system.
+    # Only accept Steam launch URIs; never execute arbitrary desktop-file commands.
+    games = {}
+    for path in sorted(SHORTCUTS.rglob('*.desktop')):
+        try:
+            if not path.is_file() or path.stat().st_size > 1024 * 1024:
+                continue
+            entry = configparser.ConfigParser(interpolation=None, strict=True)
+            entry.read_string(path.read_text())
+            fields = entry['Desktop Entry']
+            match = re.fullmatch(r'steam\s+steam://rungameid/([1-9][0-9]{0,19})', fields.get('Exec', '').strip())
+            name = fields.get('Name', '').strip()
+            if not match or not name or any(c in name for c in '\n\r'):
+                continue
+            app = match[1]
+            games.setdefault(app, {'id': app, 'name': name[:160], 'shortcut': str(path)})
+        except (OSError, UnicodeError, KeyError, configparser.Error):
+            continue
+    return sorted(games.values(), key=lambda g: (g['name'].casefold(), g['id']))
+
+
+def catalog():
+    return [{'id': g['id'], 'name': g['name']} for g in shortcuts()]
+
+
+def shortcut(app):
+    for game in shortcuts():
+        if game['id'] == app:
+            return game['shortcut']
+    raise ValueError('Game is no longer in the ROCKNIX Steam list')
+
+
+def settings():
+    try:
+        value = json.loads(STATE.read_text())
+        if not isinstance(value, dict):
+            raise ValueError('invalid settings')
+    except (OSError, ValueError):
+        value = {}
+    return {'mode': value.get('mode') if value.get('mode') in MODES else 'close',
+            'virtual_display': value.get('virtual_display') is not False}
+
+
+def mode():
+    return settings()['mode']
+
+
+def publish(error=''):
+    try:
+        session_mode = json.loads((LEASE / 'session.json').read_text())['mode']
+    except (OSError, ValueError, KeyError):
+        session_mode = None
+    atomic(PUBLIC, {**settings(), 'games': catalog(), 'busy': active(UNIT),
+                    'session_mode': session_mode, 'error': error})
+
+
+# Desktop owns controller selection independently of any Steam/game lease.
+CONTROL = Path('/run/rocknix-desktop-controller.json')
+CONTROL_PUBLIC = PUBLIC.with_name('controller.json')
+
+PROC = Path('/proc')
+
+
+def focused_game(tree):
+    """Recognize native Steam or a Gamescope process in our mapped LXC."""
+    if tree.get('focused') and tree.get('pid'):
+        try:
+            process = PROC / str(int(tree['pid']))
+            groups = [line.split(':', 2)[-1].split('/')
+                      for line in (process / 'cgroup').read_text().splitlines()]
+            if any(SCOPE in group for group in groups):
+                return True
+            # Sway reports the host PID for a Wayland client across PID namespaces.
+            # Check executable + container identity; titles/app IDs are arbitrary.
+            return (any('lxc.payload.rocknix-lxc' in group for group in groups)
+                    and (process / 'uid_map').read_text().split() == ['0', '200000', '65536']
+                    and Path(os.readlink(process / 'exe')).name == 'gamescope')
+        except (OSError, ValueError):
+            return False
+    return any(focused_game(n) for n in tree.get('nodes', []) + tree.get('floating_nodes', []))
+
+
+def menu_active():
+    """Layer menus are absent from Sway's tree; their LXC owner holds focus.
+
+    The owner survives gaps between levels and exits on pipe EOF, including
+    crashed menu clients. Do not infer ownership from a window title or a
+    guest-writable state file.
+    """
+    for process in PROC.iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            argv = (process / 'cmdline').read_bytes().split(b'\0')
+            if (len(argv) < 4 or argv[1] != b'/usr/local/bin/rocknix-menu-session'
+                    or argv[2] not in (b'apps', b'settings', b'confirm-return')):
+                continue
+            groups = [line.split(':', 2)[-1].split('/')
+                      for line in (process / 'cgroup').read_text().splitlines()]
+            if (any('lxc.payload.rocknix-lxc' in group for group in groups)
+                    and (process / 'uid_map').read_text().split() == ['0', '200000', '65536']):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def control_profile(target):
+    run(str(BASE / 'bin/rocknix-input-session'), target, timeout=20)
+
+
+def control_tick(previous):
+    selected = json.loads(CONTROL.read_text())['mode']
+    if selected not in ('auto', 'desktop', 'game'):
+        raise ValueError('Invalid controller mode')
+    target = selected
+    if selected == 'auto' and menu_active():
+        target = 'desktop'
+    elif selected == 'auto':
+        env = dict(os.environ, XDG_RUNTIME_DIR='/run/0-runtime-dir',
+                   SWAYSOCK='/run/0-runtime-dir/sway-ipc.0.sock')
+        result = subprocess.run(['swaymsg', '-t', 'get_tree', '-r'], env=env,
+                                capture_output=True, text=True, check=True, timeout=2)
+        target = 'game' if focused_game(json.loads(result.stdout)) else 'desktop'
+    if previous != target:
+        control_profile(target)
+    atomic(CONTROL_PUBLIC, {'mode': selected, 'active': target})
+    return target
+
+
+def control_begin():
+    control_profile('desktop')
+    atomic(CONTROL, {'mode': 'auto'}, 0o600)
+    atomic(CONTROL_PUBLIC, {'mode': 'auto', 'active': 'desktop'})
+
+
+def control_update():
+    try:
+        previous = json.loads(CONTROL_PUBLIC.read_text())['active']
+    except (OSError, ValueError, KeyError):
+        previous = None
+    control_tick(previous)
+
+
+def steam_running():
+    # Steam's singleton would otherwise forward the request into an unrelated
+    # native session, defeating both lifecycle ownership and Desktop's choice.
+    return run('pgrep', '-x', 'steam', check=False).returncode == 0
+
+
+def request(words):
+    if words == ['refresh']:
+        publish()
+        return
+    if words == ['controls-toggle']:
+        current = json.loads(CONTROL_PUBLIC.read_text())['active']
+        if current not in ('desktop', 'game'):
+            raise ValueError('Invalid controller state')
+        request(['controls', 'game' if current == 'desktop' else 'desktop'])
+        return
+    if words == ['show']:
+        saved = json.loads((LEASE / 'session.json').read_text())
+        if saved.get('mode') != 'keep' or not active(UNIT) or not active(SCOPE):
+            raise ValueError('No Keep Desktop Steam session is running')
+        # The reader runs inside Gamescope, retaining its display and private shm.
+        try:
+            fd = os.open(LEASE / 'steam-control', os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                os.write(fd, b'show\n')
+            finally:
+                os.close(fd)
+        except OSError as error:
+            raise ValueError('Steam is starting or restarting; retry Show Steam') from error
+    elif words == ['stop']:
+        result = run('systemctl', 'stop', '--no-block', UNIT, check=False)
+        if result.returncode and active(UNIT):
+            raise ValueError('Could not stop the Steam session')
+    elif len(words) == 2 and words[0] == 'controls' and words[1] in ('desktop', 'game'):
+        if not active('rocknix-desktop.service'):
+            raise ValueError('Desktop is no longer running')
+        control_profile(words[1])
+        atomic(CONTROL, {'mode': words[1]}, 0o600)
+        atomic(CONTROL_PUBLIC, {'mode': words[1], 'active': words[1]})
+    elif len(words) == 2 and words[0] == 'mode' and words[1] in MODES:
+        atomic(STATE, {**settings(), 'mode': words[1]}, 0o600)
+    elif len(words) == 2 and words[0] == 'virtual-display' and words[1] in ('on', 'off'):
+        atomic(STATE, {**settings(), 'virtual_display': words[1] == 'on'}, 0o600)
+    elif len(words) == 3 and words[0] == 'launch':
+        app, selected = words[1:]
+        if selected not in MODES or app not in {g['id'] for g in catalog()}:
+            raise ValueError('Game is no longer in the ROCKNIX Steam list')
+        if (LEASE / 'session.json').exists() and not active(UNIT):
+            raise ValueError('Previous game session needs host recovery')
+        if active(UNIT) or steam_running() or active(SCOPE):
+            raise ValueError('Close the existing Steam session first')
+        if not active('rocknix-desktop.service'):
+            raise ValueError('Desktop is no longer running')
+        if selected == 'keep':
+            sizing = run(str(BASE / 'guest/rocknix-gamescope'), '--print-args', check=False)
+            if sizing.returncode:
+                raise ValueError('Desktop window size unavailable; retry the launch')
+        # The native scope inherits this mount namespace from systemd-run's
+        # client. Its POSIX shm (including FEX stats) dies with the last
+        # session process, even after SIGKILL; host/guest objects stay untouched.
+        properties = ['--property=TemporaryFileSystem=/dev/shm:rw,nosuid,nodev,mode=1777',
+                      '--property=KillMode=control-group', '--property=TimeoutStopSec=180',
+                      '--property=TasksMax=1200',
+                      f'--property=ExecStopPost={BASE}/bin/rocknix-games recover']
+        if selected == 'keep':
+            properties += ['--property=BindsTo=rocknix-desktop.service sway.service',
+                           '--property=After=rocknix-desktop.service sway.service']
+        run('systemd-run', '--unit='+UNIT, '--collect', *properties,
+            str(BASE / 'bin/rocknix-games'), 'session', app, selected)
+    else:
+        raise ValueError('Invalid games request')
+    publish()
+
+
+def recover():
+    path = LEASE / 'session.json'
+    if not path.exists():
+        return
+    saved = json.loads(path.read_text())
+    # Native Steam lives outside our supervisor's cgroup. Reap its scope before
+    # restoring binfmt, controllers or Desktop, including after supervisor death.
+    if saved.get('scope') == SCOPE:
+        # stop may report "not loaded" when launch failed before scope creation.
+        run('systemctl', 'stop', SCOPE, check=False, timeout=120)
+        state = run('systemctl', 'show', '--property=ActiveState', '--value', SCOPE).stdout.strip()
+        if state not in ('inactive', 'failed'):
+            raise ValueError('Native Steam scope did not stop; session record retained')
+    for name, enabled in saved['binfmt'].items():
+        target = Path('/proc/sys/fs/binfmt_misc') / name
+        if target.exists():
+            target.write_text('1' if enabled else '0')
+    for name, governor in saved.get('governors', {}).items():
+        Path(name).write_text(governor)
+    # Desktop owns the controller selection; game exit must not change it.
+    # ExecStopPost has now reaped both the supervisor and native Steam scope.
+    state = run('systemctl', 'is-system-running', check=False).stdout.strip()
+    if saved['mode'] == 'close' and saved.get('desktop_stopped') and state not in ('stopping', 'offline'):
+        # Close mode must not be ordered after/bound to Sway: DRM stops it,
+        # and recovery must be able to wait for it from ExecStopPost.
+        run('systemctl', 'start', 'sway.service')
+        run('systemctl', 'start', 'essway.service')
+        for _ in range(3):
+            time.sleep(2)
+            run('systemctl', 'start', 'rocknix-desktop.service', check=False)
+            time.sleep(2)
+            if active('rocknix-desktop.service'):
+                break
+        else:
+            raise ValueError('Desktop recovery failed; session record retained')
+    (LEASE / 'steam-control').unlink(missing_ok=True)
+    path.unlink()
+    if PUBLIC.parent.exists() and saved['mode'] == 'keep':
+        publish()
+
+
+def session(app, selected):
+    if selected not in MODES or app not in {g['id'] for g in catalog()}:
+        raise ValueError('Invalid game')
+    LEASE.mkdir(mode=0o700, exist_ok=True)
+    # One launcher owns the global binfmt transition. A second request cannot
+    # overlap, and installer maintenance remains excluded while LXC is closed.
+    with open(LEASE / 'lock', 'w') as lock, open('/storage/.rocknix-desktop-install.lock', 'r+') as install:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(install, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        if steam_running() or active(SCOPE):
+            raise ValueError('Native Steam is already running')
+        if not active('rocknix-desktop.service'):
+            raise ValueError('Desktop stopped before launch')
+        saved = {'mode': selected, 'desktop_stopped': False, 'binfmt': {}, 'scope': SCOPE}
+        for name in ('x86', 'box32', 'box64'):
+            path = Path('/proc/sys/fs/binfmt_misc') / name
+            if path.exists():
+                saved['binfmt'][name] = path.read_text().splitlines()[0] == 'enabled'
+        if selected == 'close':
+            saved['governors'] = {str(p): p.read_text().strip() for pattern in
+                ('devices/system/cpu/cpufreq/policy*/scaling_governor', 'class/devfreq/*/governor')
+                for p in Path('/sys').glob(pattern)}
+        atomic(LEASE / 'session.json', saved, 0o600)
+        control = LEASE / 'steam-control'
+        control.unlink(missing_ok=True)
+        if selected == 'keep':
+            os.mkfifo(control, 0o600)
+        if selected == 'close':
+            saved['desktop_stopped'] = True
+            atomic(LEASE / 'session.json', saved, 0o600)
+            run('systemctl', 'stop', 'rocknix-desktop.service')
+            run('systemctl', 'stop', 'essway.service')
+        for name in saved['binfmt']:
+            (Path('/proc/sys/fs/binfmt_misc') / name).write_text('0')
+        # Inherit the system service's identity variables; the shell loads the
+        # installed ROCKNIX profile. Do not manufacture USER/LOGNAME ourselves.
+        env = dict(os.environ)
+        env.pop('_STEAM_SCOPE', None)
+        child = subprocess.Popen(['/bin/bash', str(BASE / 'bin/rocknix-games-session'), app, selected], env=env)
+        # The host watchdog includes compositor memory outside the LXC cgroup.
+        scope_seen = False
+        while child.poll() is None:
+            if not scope_seen and active(SCOPE):
+                # The workload moved to the native scope; retain the host guard.
+                run('systemctl', 'set-property', '--runtime', SCOPE, 'TasksMax=1200')
+                scope_seen = True
+            available = next(int(line.split()[1]) for line in Path('/proc/meminfo').read_text().splitlines()
+                             if line.startswith('MemAvailable:'))
+            if available < 1536 * 1024:
+                print('Stopping gamescope: less than 1.5 GiB available RAM', flush=True)
+                break
+            time.sleep(.5)
+        # The native scope call is synchronous. On exit or watchdog failure,
+        # ExecStopPost stops the independent scope before restoring Desktop.
+
+
+if __name__ == '__main__':
+    if os.getuid() != 0:
+        raise SystemExit('Host helper requires root')
+    try:
+        action, *args = sys.argv[1:]
+        if action == 'publish' and not args:
+            publish()
+        elif action == 'shortcut' and len(args) == 1:
+            print(shortcut(args[0]))
+        elif action == 'controls-begin' and not args:
+            control_begin()
+        elif action == 'controls-tick' and not args:
+            control_update()
+        elif action == 'request':
+            request(args)
+        elif action == 'session' and len(args) == 2:
+            session(*args)
+        elif action == 'recover' and not args:
+            recover()
+        else:
+            raise ValueError('Invalid games action')
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(str(error), file=sys.stderr)
+        if sys.argv[1:2] == ['request'] or (sys.argv[1:2] == ['session'] and PUBLIC.exists()):
+            publish(str(error)[:160])
+        raise SystemExit(1)
