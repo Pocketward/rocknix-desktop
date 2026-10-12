@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.6
 
 - Make installation and updates independent of the caller's umask. A fresh installation also restores access through a project directory left by an earlier restrictive installation.
 - Preserve the original InputPlumber target order when restoring native controller input.

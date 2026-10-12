@@ -72,7 +72,7 @@ The device needs Internet access, at least **4 GiB free on /storage**, and
 system battery with valid telemetry. Peripheral batteries do not count, and
 charging does not bypass the threshold.
 
-Install or update to the latest stable release (**v0.2.5**):
+Install or update to the latest stable release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Pocketward/rocknix-desktop/dev/install.sh | bash
@@ -82,7 +82,7 @@ The release includes a complete `rocknix-desktop-rp6-arm64.tar.xz` and its `.sha
 The installer downloads those two files, verifies the checksum and installs the
 prepared system. Build metadata and integration files are already inside it.
 
-Use `--release TAG` to select a specific version: append `-s -- --release v0.2.5` to `bash`.
+Use `--release TAG` to select a specific version: append `-s -- --release v0.2.6` to `bash`.
 Available versions and changes are on the
 [releases page](https://github.com/Pocketward/rocknix-desktop/releases).
 
