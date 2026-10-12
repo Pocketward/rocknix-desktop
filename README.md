@@ -62,9 +62,6 @@ report results. Discovery does not prove usable graphics or video acceleration.
 
 ## Install or update
 
-> This repository is a private build rehearsal. Pocketward downloads are not published yet.
-> The commands below describe the intended release location.
-
 Back up saves and settings, exit Desktop, and leave EmulationStation running.
 From a computer, connect to the device over SSH with `ssh root@DEVICE_IP`
 (replace `DEVICE_IP` with its network address). Run the commands below **in that
@@ -75,19 +72,18 @@ The device needs Internet access, at least **4 GiB free on /storage**, and
 system battery with valid telemetry. Peripheral batteries do not count, and
 charging does not bypass the threshold.
 
-Install or update to the latest stable release (**v0.2.0**):
+Install or update to the latest stable release (**v0.2.5**):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Pocketward/rocknix-desktop/dev/install.sh | bash
 ```
 
-CI publishes a complete `rocknix-desktop-rp6-arm64.tar.xz` and its `.sha256` file.
+The release includes a complete `rocknix-desktop-rp6-arm64.tar.xz` and its `.sha256` file.
 The installer downloads those two files, verifies the checksum and installs the
 prepared system. Build metadata and integration files are already inside it.
 
-Use `--release TAG` to select a specific version: append `-s -- --release v0.2.0` to `bash`.
-For the rolling development build, append `-s -- --dev` instead. These selectors
-cannot be combined. Available versions and changes are on the
+Use `--release TAG` to select a specific version: append `-s -- --release v0.2.5` to `bash`.
+Available versions and changes are on the
 [releases page](https://github.com/Pocketward/rocknix-desktop/releases).
 
 On eligible non-RP6 devices, the installer asks whether to proceed on untested
