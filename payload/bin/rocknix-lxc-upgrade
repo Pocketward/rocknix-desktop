@@ -271,6 +271,7 @@ def install_host(candidate, preserve_candidate=False):
 
 
 def main():
+    os.umask(0o022)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--bundle', type=Path, required=True)
     parser.add_argument('--sha256', required=True)

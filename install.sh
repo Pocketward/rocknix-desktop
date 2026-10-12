@@ -223,6 +223,7 @@ record_release() {
 }
 
 main() {
+  umask 022
   local check=0 yes=0 requested=auto release_selected=0
   VERSION=latest
   while [ "$#" -gt 0 ]; do

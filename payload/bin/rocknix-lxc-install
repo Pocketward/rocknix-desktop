@@ -62,6 +62,7 @@ def install(bundle, project, api, storage):
             if not resuming or not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or \
                     info.st_mode & 0o022 or path.read_bytes() != content:
                 raise RuntimeError(f'existing integration would be overwritten: {path}')
+    project.chmod(0o755)
     api['atomic'](journal, (json.dumps(record) + '\n').encode(), 0o600)
     for path in (project / 'managed', host, host / 'state', project / 'managed/logs',
                  data):
@@ -101,6 +102,7 @@ def install(bundle, project, api, storage):
 
 
 def main():
+    os.umask(0o022)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--bundle', type=Path, required=True)
     parser.add_argument('--replace', action='store_true',

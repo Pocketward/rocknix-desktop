@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Make installation and updates independent of the caller's umask. A fresh installation also restores access through a project directory left by an earlier restrictive installation.
+- Preserve the original InputPlumber target order when restoring native controller input.
+
 ## Highlights since v0.2.0
 
 - Discover graphics, optional H.264 decoding, controller identity and system battery on native ARM64 ROCKNIX. Allow software video fallback when no decoder qualifies and preserve untested-device consent. RP6 remains the only tested device.

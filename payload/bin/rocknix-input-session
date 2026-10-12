@@ -113,7 +113,7 @@ def targets(owner, current):
              for path in prop(current, 'TargetDevices', 'as')]
     if any(not kind or '/' in kind for kind in kinds):
         raise ValueError('InputPlumber target types are unavailable')
-    return sorted(kinds)
+    return kinds
 
 
 def discover():
@@ -200,7 +200,7 @@ def wait_for(saved, profile, kinds=None):
         current = checked(saved)
         try:
             if (prop(current, 'ProfilePath', 's') == profile
-                    and (kinds is None or targets(saved['owner'], current) == sorted(kinds))):
+                    and (kinds is None or sorted(targets(saved['owner'], current)) == sorted(kinds))):
                 return
         except subprocess.CalledProcessError:
             pass  # Target objects can disappear while InputPlumber replaces them.
